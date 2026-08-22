@@ -19,7 +19,9 @@ use crate::execution::operators::ExecutionError;
 use crate::parquet::eager_page_index_reader_factory::EagerPageIndexReaderFactory;
 use crate::parquet::encryption_support::{CometEncryptionConfig, ENCRYPTION_FACTORY_ID};
 use crate::parquet::parquet_support::SparkParquetOptions;
-use crate::parquet::schema_adapter::SparkPhysicalExprAdapterFactory;
+use crate::parquet::schema_adapter::{
+    names_equal_ignore_case_java, JvmCaseTables, SparkPhysicalExprAdapterFactory,
+};
 use arrow::datatypes::{Field, SchemaRef};
 use datafusion::config::{ParquetOptions, TableParquetOptions};
 use datafusion::datasource::listing::PartitionedFile;
@@ -37,6 +39,11 @@ use datafusion_comet_spark_expr::EvalMode;
 use datafusion_datasource::TableSchema;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Footer/page-index prefetch size for metadata reads, same as DataFusion's default. Shared
+/// with the Delta DV path so its cache-populating footer fetch issues the identical read the
+/// scan would.
+pub(crate) const METADATA_SIZE_HINT: usize = 512 * 1024;
 
 /// Initializes a DataSourceExec plan with a ParquetSource for Comet's native Parquet scan.
 ///
@@ -68,6 +75,7 @@ pub(crate) fn init_datasource_exec(
     default_values: Option<HashMap<Column, ScalarValue>>,
     session_timezone: &str,
     case_sensitive: bool,
+    jvm_case_tables: Option<Arc<JvmCaseTables>>,
     return_null_struct_if_all_fields_missing: bool,
     allow_type_promotion: bool,
     allow_timestamp_ltz_to_ntz: bool,
@@ -93,6 +101,7 @@ pub(crate) fn init_datasource_exec(
     );
     spark_parquet_options.use_field_id = use_field_id;
     spark_parquet_options.ignore_missing_field_id = ignore_missing_field_id;
+    spark_parquet_options.jvm_case_tables = jvm_case_tables;
 
     // Determine the schema and projection to use for ParquetSource.
     // When data_schema is provided, use it as the base schema so DataFusion knows the full
@@ -111,7 +120,11 @@ pub(crate) fn init_datasource_exec(
                         if case_sensitive {
                             data_field.name() == req_field.name()
                         } else {
-                            data_field.name().to_lowercase() == req_field.name().to_lowercase()
+                            names_equal_ignore_case_java(
+                                data_field.name(),
+                                req_field.name(),
+                                spark_parquet_options.jvm_case_tables.as_deref(),
+                            )
                         }
                     })
                 })
@@ -138,7 +151,7 @@ pub(crate) fn init_datasource_exec(
 
     let mut parquet_source = ParquetSource::new(table_schema)
         .with_table_parquet_options(table_parquet_options)
-        .with_metadata_size_hint(512 * 1024); // Same as DataFusion's default
+        .with_metadata_size_hint(METADATA_SIZE_HINT);
 
     if encryption_enabled {
         parquet_source = parquet_source.with_encryption_factory(
@@ -396,6 +409,7 @@ mod tests {
             None,
             "UTC",
             true,
+            None,
             false,
             false,
             false,

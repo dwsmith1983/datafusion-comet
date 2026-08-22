@@ -33,6 +33,7 @@ use datafusion_physical_expr_adapter::{
     PhysicalExprAdapterFactory,
 };
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fmt::{self, Display};
 use std::hash::{Hash, Hasher};
@@ -76,6 +77,583 @@ fn schema_has_field_ids(schema: &SchemaRef) -> bool {
     schema.fields().iter().any(|f| parse_field_id(f).is_some())
 }
 
+// ---------------------------------------------------------------------------------------------
+// JVM-shipped case tables: reproduce the PLANNING JVM's `String.toLowerCase(Locale.ROOT)`,
+// which Spark's Parquet footer field matching is built on.
+//
+// The data arrives on `NativeScanCommon` (populated by `JvmCaseTables.scala` when
+// case_sensitive = false), generated from the very JVM that plans the query, so the native
+// matcher is correct BY CONSTRUCTION for whatever JDK runs Spark. The one contextual mapping
+// (`Locale.ROOT` has exactly one: Greek capital sigma U+03A3) cannot be a per-codepoint table
+// entry, so its condition is ported as an algorithm over a shipped per-codepoint
+// classification -- see `JvmCaseTables::lowercase`.
+// ---------------------------------------------------------------------------------------------
+
+// Sigma-scan classes: the wire contract shared with `JvmCaseTables.scala`. The classes are
+// the UAX#29-style word-break classes (ALetter, Numeric, MidLetter, MidNum, MidNumLet,
+// Extend, Format) as the PLANNING JVM's legacy break iterator actually realizes them --
+// probed per codepoint from `BreakIterator.isBoundary` on the JVM side -- plus classes for
+// its pre-UAX#29 extensions (the danda and the supplementary-plane behaviors of its UTF-16
+// DFA), with cased variants split out via the JDK's `isCased`. Any codepoint outside every
+// shipped range -- and any class value this build does not know -- is a word boundary: the
+// sigma context scan stops there, which is also the safe reading for class values added by a
+// NEWER JVM-side generator.
+const CLASS_ALETTER_CASED: u8 = 1;
+const CLASS_ALETTER: u8 = 2;
+const CLASS_NUMERIC: u8 = 3;
+const CLASS_MID_LETTER: u8 = 4;
+const CLASS_MID_NUM: u8 = 5;
+const CLASS_MID_NUM_LET: u8 = 6;
+/// Cased supplementary char: attaches to the preceding word and closes it (and forms a word
+/// of its own at raw text start).
+const CLASS_SUPP_CASED: u8 = 7;
+/// U+0964/U+0965: word-terminal, chains only into digits.
+const CLASS_DANDA: u8 = 8;
+/// U+0345, the one cased combining mark: cased only when its run is attached to a word.
+const CLASS_EXTEND_CASED: u8 = 9;
+/// Cased digit-base (Nl Roman numerals): joins like CLASS_ALETTER_CASED when reached
+/// directly, but bridges only mid-num punctuation, never mid-letter.
+const CLASS_NUMERIC_CASED: u8 = 10;
+/// Non-cased Mn/Me marks: riders that attach only to genuine letter/digit bases.
+const CLASS_EXTEND: u8 = 11;
+/// Word-forming non-cased supplementary letter: a genuine letter-base that closes the word
+/// immediately after itself.
+const CLASS_SUPP_LETTER: u8 = 12;
+/// Cf format characters: fully transparent (WB4-style) -- deleted from the sequence before
+/// the scans run, so a pure-format rider chain bridges mid punctuation ("AΣ-<ZWJ>b" is one
+/// word exactly like "AΣ-b").
+const CLASS_FORMAT: u8 = 13;
+/// Supplementary chars that attach to the preceding word but never form one themselves
+/// (supplementary combining marks, tag characters): a cased mark riding on one belongs to
+/// the sigma's word only when the run hangs off a real base (`supp_mn_anchor`).
+const CLASS_SUPP_MN: u8 = 14;
+/// Word-forming supplementary digit: like CLASS_SUPP_LETTER except a riding cased mark
+/// carries only across mid-num (digit-context) punctuation, never mid-letter.
+const CLASS_SUPP_NUM: u8 = 15;
+/// Not on the wire: the absence of a class.
+const CLASS_BOUNDARY: u8 = 0;
+
+const CAPITAL_SIGMA: char = '\u{03A3}';
+const SMALL_SIGMA: char = '\u{03C3}';
+const SMALL_FINAL_SIGMA: char = '\u{03C2}';
+
+/// What a supplementary-mark run ultimately hangs off (see `supp_mn_anchor`).
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum SuppMnAnchor {
+    None,
+    Letter,
+    Digit,
+}
+
+/// The planning JVM's case data, parsed once per scan from `NativeScanCommon` and attached to
+/// [`SparkParquetOptions`]. Two tables:
+///
+///   - `lower`: every codepoint the JVM lowercases non-identically, with its full (possibly
+///     multi-char, e.g. U+0130 -> "i" + U+0307) replacement; codepoints absent here lowercase
+///     to themselves;
+///   - `class_ranges`: sorted, disjoint `(start, end, class)` codepoint ranges holding the
+///     word-break classification the JVM probed from its own `BreakIterator`.
+///
+/// `lowercase` applies Java's algorithm over that data: per codepoint, U+03A3 takes its
+/// contextual final/non-final form via the ported `isFinalCased` condition -- word-boundary
+/// based (the JDK's legacy break-iterator word rules), NOT the Unicode-standard Final_Sigma
+/// case-ignorable skip, so e.g. "A1Σ" lowers to "a1ς" -- and every other codepoint takes its
+/// table replacement. `JvmCaseTables.mirrorLowercase` on the Scala side is the line-for-line
+/// mirror of this function over the same generated data; the JVM-side parity suite proves the
+/// pair equal to the running JDK's `String.toLowerCase(Locale.ROOT)` across the full codepoint
+/// space (calibrated to zero mismatches on JDK 17, 21, and 25).
+#[derive(Debug)]
+pub struct JvmCaseTables {
+    /// Non-identity lowercase mappings: codepoint -> full replacement string.
+    lower: HashMap<char, String>,
+    /// Sorted, disjoint (start, end, class) inclusive codepoint ranges for the sigma scan.
+    class_ranges: Vec<(u32, u32, u8)>,
+    /// Precomputed content hash so `SparkParquetOptions`'s derived `Hash` stays cheap.
+    fingerprint: u64,
+}
+
+impl PartialEq for JvmCaseTables {
+    fn eq(&self, other: &Self) -> bool {
+        self.fingerprint == other.fingerprint
+            && self.class_ranges == other.class_ranges
+            && self.lower == other.lower
+    }
+}
+
+impl Eq for JvmCaseTables {}
+
+impl Hash for JvmCaseTables {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Equal contents always produce the equal (deterministically computed) fingerprint,
+        // so hashing only the fingerprint is consistent with `PartialEq`.
+        state.write_u64(self.fingerprint);
+    }
+}
+
+fn is_letter_base(cls: u8) -> bool {
+    cls == CLASS_ALETTER_CASED
+        || cls == CLASS_ALETTER
+        || cls == CLASS_SUPP_CASED
+        || cls == CLASS_SUPP_LETTER
+}
+
+fn is_digit_base(cls: u8) -> bool {
+    cls == CLASS_NUMERIC || cls == CLASS_NUMERIC_CASED
+}
+
+impl JvmCaseTables {
+    /// Parse the proto representation: `lower_cp`/`lower_repl` are index-aligned, and
+    /// `class_ranges` holds (start, end, class) triples. Malformed input (length mismatch,
+    /// trailing partial triple, out-of-range codepoints) is dropped entry-by-entry rather
+    /// than rejected: every dropped entry degrades one codepoint to identity/boundary
+    /// behavior instead of failing the scan.
+    pub fn from_proto(lower_cp: &[u32], lower_repl: &[String], class_ranges: &[u32]) -> Self {
+        let mut lower = HashMap::with_capacity(lower_cp.len());
+        for (cp, repl) in lower_cp.iter().zip(lower_repl.iter()) {
+            if let Some(c) = char::from_u32(*cp) {
+                lower.insert(c, repl.clone());
+            }
+        }
+        let ranges: Vec<(u32, u32, u8)> = class_ranges
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .filter(|t| t[0] <= t[1] && t[1] <= 0x10FFFF && u8::try_from(t[2]).is_ok())
+            .map(|t| (t[0], t[1], t[2] as u8))
+            .collect();
+
+        let mut hasher = DefaultHasher::new();
+        for (start, end, class) in &ranges {
+            hasher.write_u32(*start);
+            hasher.write_u32(*end);
+            hasher.write_u8(*class);
+        }
+        let mut lower_sorted: Vec<(&char, &String)> = lower.iter().collect();
+        lower_sorted.sort_by_key(|(c, _)| **c);
+        for (c, repl) in lower_sorted {
+            hasher.write_u32(*c as u32);
+            hasher.write(repl.as_bytes());
+        }
+
+        Self {
+            lower,
+            class_ranges: ranges,
+            fingerprint: hasher.finish(),
+        }
+    }
+
+    /// Sigma-scan class of `c`; `CLASS_BOUNDARY` when no shipped range covers it.
+    fn class_of(&self, c: char) -> u8 {
+        let cp = c as u32;
+        let mut lo = 0usize;
+        let mut hi = self.class_ranges.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let (start, end, class) = self.class_ranges[mid];
+            if cp < start {
+                hi = mid;
+            } else if cp > end {
+                lo = mid + 1;
+            } else {
+                return class;
+            }
+        }
+        CLASS_BOUNDARY
+    }
+
+    /// First position at or beyond `start` (stepping by `step`, i.e. -1 backward / +1
+    /// forward) whose class is not CLASS_EXTEND. Returns `None` if the scan runs off the
+    /// array without finding one.
+    fn skip_extends(&self, cps: &[char], start: isize, step: isize) -> Option<usize> {
+        let mut k = start;
+        while k >= 0 && (k as usize) < cps.len() {
+            if self.class_of(cps[k as usize]) != CLASS_EXTEND {
+                return Some(k as usize);
+            }
+            k += step;
+        }
+        None
+    }
+
+    /// As [`Self::skip_extends`], but also skips CLASS_EXTEND_CASED, reporting whether one
+    /// was walked: a cased mark (U+0345) crossed while looking for a base is itself cased
+    /// whenever the landing validates the run.
+    fn skip_extends_tracking_cased(
+        &self,
+        cps: &[char],
+        start: isize,
+        step: isize,
+    ) -> (Option<usize>, bool) {
+        let mut k = start;
+        let mut saw_cased = false;
+        while k >= 0 && (k as usize) < cps.len() {
+            let cls = self.class_of(cps[k as usize]);
+            if cls != CLASS_EXTEND && cls != CLASS_EXTEND_CASED {
+                return (Some(k as usize), saw_cased);
+            }
+            if cls == CLASS_EXTEND_CASED {
+                saw_cased = true;
+            }
+            k += step;
+        }
+        (None, saw_cased)
+    }
+
+    /// What the supplementary-mark run at `k` (CLASS_SUPP_MN) ultimately hangs off, walking
+    /// down through further marks and supplementary chars: a letter-flavored base, a
+    /// digit-flavored base, or nothing word-forming. A cased mark riding the run belongs to
+    /// the sigma's word only per this anchor.
+    fn supp_mn_anchor(&self, cps: &[char], k: usize) -> SuppMnAnchor {
+        let mut m = k as isize - 1;
+        while m >= 0 {
+            let cls = self.class_of(cps[m as usize]);
+            if cls != CLASS_SUPP_MN && cls != CLASS_EXTEND && cls != CLASS_EXTEND_CASED {
+                break;
+            }
+            m -= 1;
+        }
+        if m < 0 {
+            return SuppMnAnchor::None;
+        }
+        match self.class_of(cps[m as usize]) {
+            CLASS_ALETTER_CASED | CLASS_ALETTER | CLASS_SUPP_CASED | CLASS_SUPP_LETTER => {
+                SuppMnAnchor::Letter
+            }
+            CLASS_NUMERIC | CLASS_NUMERIC_CASED | CLASS_SUPP_NUM => SuppMnAnchor::Digit,
+            _ => SuppMnAnchor::None,
+        }
+    }
+
+    /// Backward half of the ported `isFinalCased`: is there a cased letter before position
+    /// `i` within the sigma's word? Runs over the FORMAT-FILTERED sequence; `leading_format`
+    /// says whether format chars were filtered off the raw text start.
+    fn scan_back_finds_cased(&self, cps: &[char], i: usize, leading_format: bool) -> bool {
+        let mut last_letter = true; // the sigma itself is a letter
+        let mut j = i as isize - 1;
+        while j >= 0 {
+            match self.class_of(cps[j as usize]) {
+                CLASS_ALETTER_CASED | CLASS_NUMERIC_CASED => return true,
+                CLASS_ALETTER => {
+                    last_letter = true;
+                    j -= 1;
+                }
+                CLASS_NUMERIC => {
+                    last_letter = false;
+                    j -= 1;
+                }
+                CLASS_EXTEND => {
+                    // Non-cased marks attach only to a real base below them; anything else
+                    // (mid punctuation, danda, boundary, text start) leaves the run
+                    // unattached.
+                    let Some(k) = self.skip_extends(cps, j, -1) else {
+                        return false;
+                    };
+                    let b = self.class_of(cps[k]);
+                    let is_continuer = b == CLASS_ALETTER_CASED
+                        || b == CLASS_NUMERIC_CASED
+                        || b == CLASS_NUMERIC
+                        || b == CLASS_EXTEND_CASED
+                        || b == CLASS_ALETTER
+                        || b == CLASS_SUPP_CASED
+                        || b == CLASS_SUPP_LETTER
+                        || b == CLASS_SUPP_NUM;
+                    if !is_continuer {
+                        return false;
+                    }
+                    j = k as isize;
+                }
+                CLASS_SUPP_CASED => {
+                    // Closes the preceding word, so the scan stops -- except at RAW text
+                    // start (no filtered-out leading format chars), where the DFA keeps it
+                    // joined to what follows.
+                    return j == 0 && !leading_format;
+                }
+                CLASS_SUPP_LETTER | CLASS_SUPP_MN | CLASS_SUPP_NUM => {
+                    // Attach/close and never themselves cased; nothing beyond is reachable.
+                    return false;
+                }
+                CLASS_EXTEND_CASED => {
+                    // Cased combining mark (U+0345): cased when its run hangs off a base --
+                    // a BMP letter/digit, a word-forming supplementary char (which closes a
+                    // word right below the mark, merging the mark into the sigma's
+                    // segment), or an ANCHORED supplementary mark.
+                    let (Some(k), _) = self.skip_extends_tracking_cased(cps, j - 1, -1) else {
+                        return false;
+                    };
+                    let b = self.class_of(cps[k]);
+                    if b == CLASS_ALETTER_CASED
+                        || b == CLASS_NUMERIC
+                        || b == CLASS_NUMERIC_CASED
+                        || b == CLASS_ALETTER
+                        || b == CLASS_SUPP_CASED
+                        || b == CLASS_SUPP_LETTER
+                        || b == CLASS_SUPP_NUM
+                    {
+                        return true;
+                    }
+                    if b == CLASS_SUPP_MN {
+                        return self.supp_mn_anchor(cps, k) != SuppMnAnchor::None;
+                    }
+                    return false;
+                }
+                CLASS_DANDA => {
+                    // Backward across a danda: the word part before it must end in letters
+                    // (grammar: letters, optional danda, then number+word chains) -- or
+                    // carry a riding cased mark on a word-forming base, or be a cased
+                    // supplementary char at text start -- and the danda itself chains only
+                    // into digits after it.
+                    if last_letter {
+                        return false;
+                    }
+                    let (Some(k), saw_cased_mark) =
+                        self.skip_extends_tracking_cased(cps, j - 1, -1)
+                    else {
+                        return false;
+                    };
+                    let b = self.class_of(cps[k]);
+                    if b == CLASS_ALETTER_CASED {
+                        return true;
+                    }
+                    if b == CLASS_SUPP_CASED {
+                        return saw_cased_mark || (k == 0 && !leading_format);
+                    }
+                    if b == CLASS_SUPP_LETTER {
+                        return saw_cased_mark;
+                    }
+                    if b == CLASS_SUPP_MN {
+                        return saw_cased_mark
+                            && self.supp_mn_anchor(cps, k) == SuppMnAnchor::Letter;
+                    }
+                    if b != CLASS_ALETTER {
+                        return false;
+                    }
+                    if saw_cased_mark {
+                        return true;
+                    }
+                    last_letter = true;
+                    j = k as isize;
+                }
+                cls @ (CLASS_MID_LETTER | CLASS_MID_NUM | CLASS_MID_NUM_LET) => {
+                    // `<mid-letter><let>` / `<mid-num><digit>` require a genuine
+                    // letter/digit base before the punctuation; scanning backward
+                    // legitimately walks marks-then-base (marks trail their base). A cased
+                    // mark walked over rides whatever the punctuation hangs off, including
+                    // a context-matching anchored supplementary mark or supplementary
+                    // digit.
+                    let mw_ok = cls == CLASS_MID_LETTER || cls == CLASS_MID_NUM_LET;
+                    let mn_ok = cls == CLASS_MID_NUM || cls == CLASS_MID_NUM_LET;
+                    let (Some(real_pos), saw_cased_mark) =
+                        self.skip_extends_tracking_cased(cps, j - 1, -1)
+                    else {
+                        return false;
+                    };
+                    let b = self.class_of(cps[real_pos]);
+                    if last_letter
+                        && mw_ok
+                        && saw_cased_mark
+                        && b == CLASS_SUPP_MN
+                        && self.supp_mn_anchor(cps, real_pos) == SuppMnAnchor::Letter
+                    {
+                        return true;
+                    }
+                    if !last_letter
+                        && mn_ok
+                        && saw_cased_mark
+                        && (b == CLASS_SUPP_NUM
+                            || (b == CLASS_SUPP_MN
+                                && self.supp_mn_anchor(cps, real_pos) == SuppMnAnchor::Digit))
+                    {
+                        return true;
+                    }
+                    let bridge_valid = (last_letter && mw_ok && is_letter_base(b))
+                        || (!last_letter && mn_ok && is_digit_base(b));
+                    if !bridge_valid {
+                        return false;
+                    }
+                    if saw_cased_mark {
+                        return true;
+                    }
+                    j = real_pos as isize;
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// Forward half of the ported `isFinalCased`: is there a cased letter after position `i`
+    /// within the sigma's word? Runs over the FORMAT-FILTERED sequence.
+    fn scan_fwd_finds_cased(&self, cps: &[char], i: usize) -> bool {
+        let mut last_letter = true;
+        let mut j = i + 1;
+        while j < cps.len() {
+            match self.class_of(cps[j]) {
+                CLASS_ALETTER_CASED | CLASS_NUMERIC_CASED => return true,
+                CLASS_ALETTER => {
+                    last_letter = true;
+                    j += 1;
+                }
+                CLASS_NUMERIC => {
+                    last_letter = false;
+                    j += 1;
+                }
+                CLASS_EXTEND => {
+                    // A mark run trailing the anchor is properly attached in text order, so
+                    // the run stays open past it, including onto mid punctuation on its far
+                    // side.
+                    let Some(k) = self.skip_extends(cps, j as isize, 1) else {
+                        return false;
+                    };
+                    let b = self.class_of(cps[k]);
+                    let is_continuer = b == CLASS_ALETTER_CASED
+                        || b == CLASS_NUMERIC_CASED
+                        || b == CLASS_NUMERIC
+                        || b == CLASS_EXTEND_CASED
+                        || b == CLASS_ALETTER
+                        || b == CLASS_SUPP_CASED
+                        || b == CLASS_SUPP_LETTER
+                        || b == CLASS_SUPP_MN
+                        || b == CLASS_SUPP_NUM
+                        || b == CLASS_DANDA
+                        || b == CLASS_MID_LETTER
+                        || b == CLASS_MID_NUM
+                        || b == CLASS_MID_NUM_LET;
+                    if !is_continuer {
+                        return false;
+                    }
+                    j = k;
+                }
+                CLASS_SUPP_CASED | CLASS_EXTEND_CASED => {
+                    // Attaches to the current word, so the scan sees it (cased).
+                    return true;
+                }
+                CLASS_SUPP_LETTER | CLASS_SUPP_MN | CLASS_SUPP_NUM => {
+                    // Attach to the current word and close it; never themselves cased, and
+                    // nothing beyond is reachable.
+                    return false;
+                }
+                // The danda attaches only to a word part that ends in letters (reached
+                // after digits the word is already closed) and continues only into a digit
+                // -- unless that digit is itself cased (a Roman numeral), which resolves
+                // the scan immediately.
+                CLASS_DANDA if !last_letter => return false,
+                CLASS_DANDA
+                    if j + 1 < cps.len() && self.class_of(cps[j + 1]) == CLASS_NUMERIC_CASED =>
+                {
+                    return true;
+                }
+                CLASS_DANDA if j + 1 < cps.len() && self.class_of(cps[j + 1]) == CLASS_NUMERIC => {
+                    last_letter = false;
+                    j += 2;
+                }
+                cls @ (CLASS_MID_LETTER | CLASS_MID_NUM | CLASS_MID_NUM_LET) => {
+                    // `<mid-letter><let>` / `<mid-num><digit>` require a genuine
+                    // letter/digit base IMMEDIATELY after the punctuation -- unlike the
+                    // backward scan, marks here are never skipped past: a mark directly
+                    // after the punctuation is attached to the punctuation, not a base, so
+                    // it blocks the bridge. (Format chars are already filtered out, which
+                    // is what lets "AΣ-<ZWJ>b" bridge exactly like "AΣ-b".)
+                    let mw_ok = cls == CLASS_MID_LETTER || cls == CLASS_MID_NUM_LET;
+                    let mn_ok = cls == CLASS_MID_NUM || cls == CLASS_MID_NUM_LET;
+                    if j + 1 >= cps.len() {
+                        return false;
+                    }
+                    let b = self.class_of(cps[j + 1]);
+                    if (last_letter && mw_ok && is_letter_base(b))
+                        || (!last_letter && mn_ok && is_digit_base(b))
+                    {
+                        j += 1;
+                    } else {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// Lowercase `s` the way the planning JVM's `String.toLowerCase(Locale.ROOT)` does.
+    pub fn lowercase(&self, s: &str) -> String {
+        let raw: Vec<char> = s.chars().collect();
+        // Built lazily on the first sigma: the format-filtered sequence the scans run over
+        // (WB4-style: the legacy break iterator's `<ignore>` class loops on every DFA
+        // state), the raw->filtered index map, and whether format chars led the raw text.
+        let mut filtered: Option<(Vec<char>, Vec<usize>, bool)> = None;
+        let mut out = String::with_capacity(s.len());
+        for (i, &c) in raw.iter().enumerate() {
+            if c == CAPITAL_SIGMA {
+                // The condition consults the ORIGINAL neighbors, exactly as the JDK scans
+                // `src`, not the partially-lowered output. The final/non-final target chars
+                // are Unicode-stable (pinned in `ConditionalSpecialCasing`'s entry table).
+                let (f, idx, leading_format) = filtered.get_or_insert_with(|| {
+                    let mut f = Vec::with_capacity(raw.len());
+                    let mut idx = vec![0usize; raw.len()];
+                    for (k, &rc) in raw.iter().enumerate() {
+                        idx[k] = f.len();
+                        if self.class_of(rc) != CLASS_FORMAT {
+                            f.push(rc);
+                        }
+                    }
+                    let leading_format = self.class_of(raw[0]) == CLASS_FORMAT;
+                    (f, idx, leading_format)
+                });
+                let fi = idx[i];
+                let is_final = self.scan_back_finds_cased(f, fi, *leading_format)
+                    && !self.scan_fwd_finds_cased(f, fi);
+                out.push(if is_final {
+                    SMALL_FINAL_SIGMA
+                } else {
+                    SMALL_SIGMA
+                });
+            } else if let Some(repl) = self.lower.get(&c) {
+                out.push_str(repl);
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+}
+
+/// Lowercase `s` for case-insensitive field matching. With tables (populated whenever
+/// `case_sensitive = false`, shared by the core Parquet scan and the Delta contrib scan) this
+/// reproduces the planning JVM's `String.toLowerCase(Locale.ROOT)` exactly.
+///
+/// Without tables, fall back to Rust's `str::to_lowercase`, which agrees with Java on all
+/// simple mappings and differs only where the two Unicode snapshots or the sigma context
+/// diverge. This is a real, live path, not just a defensive default: the Iceberg native scan
+/// (`SparkPhysicalExprAdapterFactory::new(_, None)`) defaults `case_sensitive = false` and
+/// always reaches this fallback for its schema name remap, alongside
+/// `parquet_convert_struct_to_struct`'s general struct-cast matching and Rust-only unit tests
+/// that construct `SparkParquetOptions` directly.
+pub(crate) fn java_lowercase(s: &str, tables: Option<&JvmCaseTables>) -> String {
+    match tables {
+        Some(t) => t.lowercase(s),
+        None => {
+            log::debug!(
+                "case-insensitive name matching without JVM case tables; \
+                 falling back to str::to_lowercase for {s:?}"
+            );
+            s.to_lowercase()
+        }
+    }
+}
+
+/// Case-insensitive name equality mirroring Spark's actual Parquet footer field matching,
+/// which groups/looks up physical column names by full-string `toLowerCase(Locale.ROOT)`
+/// (see `ParquetReadSupport.clipParquetGroupFields`'s `caseInsensitiveParquetFieldMap`, and
+/// `ParquetSchemaConverter.normalizeFieldName` for the vectorized `ParquetColumn` path -- both
+/// key on `name.toLowerCase(Locale.ROOT)`, not a per-character `String.equalsIgnoreCase`
+/// comparison). Two names are equal here iff their [`java_lowercase`] forms are equal.
+pub(crate) fn names_equal_ignore_case_java(
+    a: &str,
+    b: &str,
+    tables: Option<&JvmCaseTables>,
+) -> bool {
+    java_lowercase(a, tables) == java_lowercase(b, tables)
+}
+
 /// Remap physical schema field names to match logical schema field names. Mirrors Spark's
 /// `clipParquetGroupFields`: prefer ID match for any logical field that carries a
 /// `PARQUET:field_id`, fall back to case-insensitive name match otherwise.
@@ -88,6 +666,7 @@ fn remap_physical_schema(
     logical_schema: &SchemaRef,
     physical_schema: &SchemaRef,
     case_sensitive: bool,
+    case_tables: Option<&JvmCaseTables>,
     use_field_id: bool,
     ignore_missing_field_id: bool,
 ) -> DataFusionResult<(SchemaRef, HashMap<String, String>)> {
@@ -143,29 +722,43 @@ fn remap_physical_schema(
         HashMap::new()
     };
 
-    // Names of ID-bearing logical fields whose ID is not present in the file. Any physical
-    // field that shares one of these names must be renamed to something the
-    // `DefaultPhysicalExprAdapter` cannot name-match, otherwise the read would silently fall
-    // through to a name match. Spark's `matchIdField` solves the same problem with
+    // Names of ID-bearing logical fields. Spark's `matchIdField` resolves these strictly by
+    // ID and never falls back to a name match, so a physical field that carries such a name
+    // WITHOUT being the ID match (its ID is absent, different, or the logical ID matched a
+    // different physical field) must be renamed to something the `DefaultPhysicalExprAdapter`
+    // cannot name-match; otherwise the read would silently resolve the wrong column instead
+    // of null-filling. Spark's `matchIdField` solves the same problem with
     // `generateFakeColumnName` (see `ParquetReadSupport.scala`).
-    let unmatched_id_logical_names: std::collections::HashSet<String> = if should_match_by_id {
+    let id_logical_names: std::collections::HashSet<&str> = if should_match_by_id {
         logical_schema
             .fields()
             .iter()
-            .filter_map(|lf| {
-                parse_field_id(lf).and_then(|id| {
-                    if id_to_phys_names.contains_key(&id) {
-                        None
-                    } else {
-                        Some(lf.name().clone())
-                    }
-                })
-            })
+            .filter(|lf| parse_field_id(lf).is_some())
+            .map(|lf| lf.name().as_str())
             .collect()
     } else {
         std::collections::HashSet::new()
     };
+
+    // Fake names must never collide with a real column from either schema: a physical column
+    // legitimately named like the fake pattern would otherwise become indistinguishable from
+    // the shield's output and could steal an exact-name match. Spark gets the same guarantee
+    // from the random UUID in `generateFakeColumnName`; here the counter is bumped past any
+    // reserved name instead so the result stays deterministic.
+    let reserved_names: std::collections::HashSet<&str> = logical_schema
+        .fields()
+        .iter()
+        .chain(physical_schema.fields().iter())
+        .map(|f| f.name().as_str())
+        .collect();
     let mut fake_counter: usize = 0;
+    let mut next_fake_name = move || loop {
+        fake_counter += 1;
+        let candidate = format!("__comet_unmatched_field_id_{}", fake_counter);
+        if !reserved_names.contains(candidate.as_str()) {
+            return candidate;
+        }
+    };
 
     let mut name_map: HashMap<String, String> = HashMap::new();
     let remapped_fields: Vec<FieldRef> = physical_schema
@@ -192,27 +785,20 @@ fn remap_physical_schema(
                 }
             }
 
-            // Block accidental name match for ID-bearing logical fields whose ID is missing
-            // from the file. Mirrors Spark's `generateFakeColumnName` in `matchIdField`.
-            if should_match_by_id
-                && unmatched_id_logical_names
-                    .iter()
-                    .any(|name| name.eq_ignore_ascii_case(field.name()))
-            {
-                fake_counter += 1;
-                let fake_name = format!("__comet_unmatched_field_id_{}", fake_counter);
-                return Arc::new(
-                    Field::new(fake_name, field.data_type().clone(), field.is_nullable())
-                        .with_metadata(field.metadata().clone()),
-                );
-            }
-
-            // Name match. Spark's `matchIdField` does not fall through to a name match for
-            // ID-bearing logical fields, so skip those when the schema is ID-bearing.
+            // Name match. Spark resolves every non-ID-bearing logical field by name --
+            // `matchCaseSensitiveField` / `matchCaseInsensitiveField` in
+            // `clipParquetGroupFields` -- even when field-ID matching is on, and that
+            // resolution takes the physical field regardless of any ID-bearing logical field
+            // with a similar name (`matchIdField` only ever fakes the REQUESTED field's name,
+            // never the physical column's). Only ID-bearing logical fields skip the name
+            // fallback when the schema is ID-bearing. Case-sensitive mode needs no rename
+            // here (the downstream adapter's exact-name lookup already hits); the
+            // case-insensitive lookup rewrites the physical name, and a successful match
+            // claims the field before the shield below can hide it.
             if !case_sensitive {
                 let logical_field = logical_schema.fields().iter().find(|lf| {
                     let lf_has_id = should_match_by_id && parse_field_id(lf).is_some();
-                    !lf_has_id && lf.name().eq_ignore_ascii_case(field.name())
+                    !lf_has_id && names_equal_ignore_case_java(lf.name(), field.name(), case_tables)
                 });
                 if let Some(logical_field) = logical_field {
                     if logical_field.name() != field.name() {
@@ -226,6 +812,35 @@ fn remap_physical_schema(
                             .with_metadata(field.metadata().clone()),
                         );
                     }
+                    return Arc::clone(field);
+                }
+            }
+
+            // Shield: any remaining physical field whose name would hit an ID-bearing
+            // logical field downstream gets a fake name (Spark's `generateFakeColumnName`
+            // equivalent). ID-bearing logical fields resolve strictly by ID, so a name hit
+            // on one would read the wrong column instead of null-filling it or leaving it to
+            // its real ID match. The collision test mirrors the matcher that would otherwise
+            // hit: exact names in case-sensitive mode (Spark's `matchCaseSensitiveField` /
+            // the row converter's exact `catalystFieldIdxByName`), the planning JVM's
+            // lowercase fold otherwise.
+            if should_match_by_id {
+                let collides = if case_sensitive {
+                    id_logical_names.contains(field.name().as_str())
+                } else {
+                    id_logical_names
+                        .iter()
+                        .any(|name| names_equal_ignore_case_java(name, field.name(), case_tables))
+                };
+                if collides {
+                    return Arc::new(
+                        Field::new(
+                            next_fake_name(),
+                            field.data_type().clone(),
+                            field.is_nullable(),
+                        )
+                        .with_metadata(field.metadata().clone()),
+                    );
                 }
             }
 
@@ -334,11 +949,15 @@ fn reject_on_non_empty_expr(
 
 /// Check if a specific column name has duplicate matches in the physical schema
 /// (case-insensitive). Returns the error info if so.
-fn check_column_duplicate(col_name: &str, physical_schema: &SchemaRef) -> Option<(String, String)> {
+fn check_column_duplicate(
+    col_name: &str,
+    physical_schema: &SchemaRef,
+    case_tables: Option<&JvmCaseTables>,
+) -> Option<(String, String)> {
     let matches: Vec<&str> = physical_schema
         .fields()
         .iter()
-        .filter(|pf| pf.name().eq_ignore_ascii_case(col_name))
+        .filter(|pf| names_equal_ignore_case_java(pf.name(), col_name, case_tables))
         .map(|pf| pf.name().as_str())
         .collect();
     if matches.len() > 1 {
@@ -374,6 +993,7 @@ impl PhysicalExprAdapterFactory for SparkPhysicalExprAdapterFactory {
                     &logical_file_schema,
                     &physical_file_schema,
                     self.parquet_options.case_sensitive,
+                    self.parquet_options.jvm_case_tables.as_deref(),
                     self.parquet_options.use_field_id,
                     self.parquet_options.ignore_missing_field_id,
                 )?;
@@ -450,12 +1070,31 @@ impl PhysicalExprAdapter for SparkPhysicalExprAdapter {
         // a field with multiple case-insensitive matches in the physical schema.
         // Only the columns actually referenced trigger the error (not the whole schema).
         if let Some(orig_physical) = &self.original_physical_schema {
+            // ID-bearing logical fields resolve strictly by field ID (`matchIdField`) and
+            // never reach Spark's case-insensitive name lookup, so its duplicate-name error
+            // (`foundDuplicateFieldInCaseInsensitiveModeError`) never fires for them; exempt
+            // them here the same way.
+            let match_by_id = self.parquet_options.use_field_id
+                && schema_has_field_ids(&self.logical_file_schema);
             // Walk the expression tree to find Column references
             let mut duplicate_err: Option<DataFusionError> = None;
             let _ = Arc::<dyn PhysicalExpr>::clone(&expr).transform(|e| {
                 if let Some(col) = e.downcast_ref::<Column>() {
-                    if let Some((req, matched)) = check_column_duplicate(col.name(), orig_physical)
-                    {
+                    let id_routed = match_by_id
+                        && self
+                            .logical_file_schema
+                            .field_with_name(col.name())
+                            .ok()
+                            .and_then(parse_field_id)
+                            .is_some();
+                    if id_routed {
+                        return Ok(Transformed::no(e));
+                    }
+                    if let Some((req, matched)) = check_column_duplicate(
+                        col.name(),
+                        orig_physical,
+                        self.parquet_options.jvm_case_tables.as_deref(),
+                    ) {
                         duplicate_err = Some(DataFusionError::External(Box::new(
                             SparkError::DuplicateFieldCaseInsensitive {
                                 required_field_name: req,
@@ -548,10 +1187,13 @@ impl SparkPhysicalExprAdapter {
                         .iter()
                         .find(|f| f.name() == col_name)
                 } else {
-                    self.logical_file_schema
-                        .fields()
-                        .iter()
-                        .find(|f| f.name().eq_ignore_ascii_case(col_name))
+                    self.logical_file_schema.fields().iter().find(|f| {
+                        names_equal_ignore_case_java(
+                            f.name(),
+                            col_name,
+                            self.parquet_options.jvm_case_tables.as_deref(),
+                        )
+                    })
                 };
                 let physical_field = if self.parquet_options.case_sensitive {
                     self.physical_file_schema
@@ -559,10 +1201,13 @@ impl SparkPhysicalExprAdapter {
                         .iter()
                         .find(|f| f.name() == col_name)
                 } else {
-                    self.physical_file_schema
-                        .fields()
-                        .iter()
-                        .find(|f| f.name().eq_ignore_ascii_case(col_name))
+                    self.physical_file_schema.fields().iter().find(|f| {
+                        names_equal_ignore_case_java(
+                            f.name(),
+                            col_name,
+                            self.parquet_options.jvm_case_tables.as_deref(),
+                        )
+                    })
                 };
 
                 // Remap the column index to the physical file schema so
@@ -571,10 +1216,13 @@ impl SparkPhysicalExprAdapter {
                 let physical_index = if self.parquet_options.case_sensitive {
                     self.physical_file_schema.index_of(col_name).ok()
                 } else {
-                    self.physical_file_schema
-                        .fields()
-                        .iter()
-                        .position(|f| f.name().eq_ignore_ascii_case(col_name))
+                    self.physical_file_schema.fields().iter().position(|f| {
+                        names_equal_ignore_case_java(
+                            f.name(),
+                            col_name,
+                            self.parquet_options.jvm_case_tables.as_deref(),
+                        )
+                    })
                 };
 
                 if let (Some(logical_field), Some(physical_field), Some(phys_idx)) =
@@ -951,11 +1599,13 @@ impl SparkPhysicalExprAdapter {
                 let is_missing = if self.parquet_options.case_sensitive {
                     self.physical_file_schema.field_with_name(col_name).is_err()
                 } else {
-                    !self
-                        .physical_file_schema
-                        .fields()
-                        .iter()
-                        .any(|f| f.name().eq_ignore_ascii_case(col_name))
+                    !self.physical_file_schema.fields().iter().any(|f| {
+                        names_equal_ignore_case_java(
+                            f.name(),
+                            col_name,
+                            self.parquet_options.jvm_case_tables.as_deref(),
+                        )
+                    })
                 };
 
                 if !is_missing {
@@ -1102,10 +1752,16 @@ impl PhysicalExpr for RejectOnNonEmpty {
 #[cfg(test)]
 mod test {
     use crate::parquet::parquet_support::SparkParquetOptions;
-    use crate::parquet::schema_adapter::SparkPhysicalExprAdapterFactory;
+    use crate::parquet::schema_adapter::{
+        java_lowercase, names_equal_ignore_case_java, remap_physical_schema, JvmCaseTables,
+        SparkPhysicalExprAdapterFactory, CLASS_ALETTER_CASED, CLASS_DANDA, CLASS_EXTEND,
+        CLASS_EXTEND_CASED, CLASS_FORMAT, CLASS_MID_LETTER, CLASS_MID_NUM, CLASS_MID_NUM_LET,
+        CLASS_NUMERIC, CLASS_NUMERIC_CASED, CLASS_SUPP_CASED, CLASS_SUPP_LETTER, CLASS_SUPP_MN,
+        CLASS_SUPP_NUM,
+    };
     use arrow::array::UInt32Array;
     use arrow::array::{
-        BinaryArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array,
+        Array, BinaryArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array,
         Int64Array, StringArray, TimestampMicrosecondArray,
     };
     use arrow::datatypes::SchemaRef;
@@ -1122,7 +1778,8 @@ mod test {
     use datafusion_comet_spark_expr::EvalMode;
     use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
     use futures::StreamExt;
-    use parquet::arrow::ArrowWriter;
+    use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
+    use std::collections::HashMap;
     use std::fs::File;
     use std::sync::Arc;
 
@@ -1774,5 +2431,869 @@ mod test {
             err_msg.contains("Found duplicate field"),
             "Expected duplicate field error, got: {err_msg}"
         );
+    }
+
+    /// Build a nullable Int64 field carrying a Parquet field ID.
+    fn field_with_id(name: &str, id: i32) -> Field {
+        Field::new(name, DataType::Int64, true).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            id.to_string(),
+        )]))
+    }
+
+    /// Write a Parquet file from `file_schema`/`columns`, then scan it with
+    /// `required_schema` through the Spark expression adapter and return the first batch.
+    async fn scan_with_adapter(
+        file_schema: SchemaRef,
+        columns: Vec<Arc<dyn arrow::array::Array>>,
+        required_schema: SchemaRef,
+        spark_parquet_options: SparkParquetOptions,
+    ) -> Result<RecordBatch, DataFusionError> {
+        let batch = RecordBatch::try_new(Arc::clone(&file_schema), columns).unwrap();
+
+        let filename = get_temp_filename();
+        let filename = filename.as_path().as_os_str().to_str().unwrap().to_string();
+        let file = File::create(&filename).unwrap();
+        let mut writer = ArrowWriter::try_new(file, file_schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let expr_adapter_factory: Arc<dyn PhysicalExprAdapterFactory> = Arc::new(
+            SparkPhysicalExprAdapterFactory::new(spark_parquet_options, None),
+        );
+
+        let object_store_url = ObjectStoreUrl::local_filesystem();
+        let parquet_source = ParquetSource::new(required_schema);
+        let files = FileGroup::new(vec![PartitionedFile::from_path(filename).unwrap()]);
+        let file_scan_config =
+            FileScanConfigBuilder::new(object_store_url, Arc::new(parquet_source))
+                .with_file_groups(vec![files])
+                .with_expr_adapter(Some(expr_adapter_factory))
+                .build();
+
+        let parquet_exec = DataSourceExec::new(Arc::new(file_scan_config));
+        let mut stream = parquet_exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap();
+        stream.next().await.unwrap()
+    }
+
+    /// File: one column `κ` (U+03BA) with field ID 2 holding 7. Required: `Κ` (U+039A,
+    /// field ID 1) and ID-less `κ`; case-sensitive, field-ID reading on. Spark routes `Κ`
+    /// through `matchIdField` (no ID 1 in the file -> null-filled behind a faked REQUESTED
+    /// name) and resolves `κ` by exact name through `matchCaseSensitiveField`, reading the
+    /// real column: the result is (NULL, 7), never (NULL, NULL).
+    #[tokio::test]
+    async fn parquet_field_id_miss_null_fills_but_exact_name_sibling_still_reads() {
+        let file_schema = Arc::new(Schema::new(vec![field_with_id("\u{3BA}", 2)]));
+        let col = Arc::new(Int64Array::from(vec![7])) as Arc<dyn arrow::array::Array>;
+        let required_schema = Arc::new(Schema::new(vec![
+            field_with_id("\u{39A}", 1),
+            Field::new("\u{3BA}", DataType::Int64, true),
+        ]));
+
+        let mut opts = SparkParquetOptions::new(EvalMode::Legacy, "UTC", false);
+        opts.case_sensitive = true;
+        opts.use_field_id = true;
+
+        let batch = scan_with_adapter(file_schema, vec![col], required_schema, opts)
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let capital = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert!(capital.is_null(0));
+        let small = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert!(!small.is_null(0));
+        assert_eq!(small.value(0), 7);
+    }
+
+    /// Case-insensitive variant of the Kappa scenario. Spark's `matchCaseInsensitiveField`
+    /// resolves the ID-less requested `κ` through the `toLowerCase(Locale.ROOT)`-keyed map
+    /// of the file's fields, which holds the physical `κ`; the unmatched-ID requested `Κ`
+    /// is null-filled and never blocks that lookup. Same (NULL, 7) result as the
+    /// case-sensitive read.
+    #[tokio::test]
+    async fn parquet_field_id_miss_case_insensitive_sibling_still_reads() {
+        let file_schema = Arc::new(Schema::new(vec![field_with_id("\u{3BA}", 2)]));
+        let col = Arc::new(Int64Array::from(vec![7])) as Arc<dyn arrow::array::Array>;
+        let required_schema = Arc::new(Schema::new(vec![
+            field_with_id("\u{39A}", 1),
+            Field::new("\u{3BA}", DataType::Int64, true),
+        ]));
+
+        let mut opts = SparkParquetOptions::new(EvalMode::Legacy, "UTC", false);
+        opts.case_sensitive = false;
+        opts.use_field_id = true;
+
+        let batch = scan_with_adapter(file_schema, vec![col], required_schema, opts)
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let capital = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert!(capital.is_null(0));
+        let small = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert!(!small.is_null(0));
+        assert_eq!(small.value(0), 7);
+    }
+
+    /// File: a stray ID-less column literally named `A` = [10, 20] FIRST, then `a` with
+    /// field ID 1 = [1, 2]. Required: `A` with field ID 1, case-insensitive, field-ID
+    /// reading on. Spark's `matchIdField` resolves requested `A` to physical `a` by ID; the
+    /// stray `A` is never requested, and no case-insensitive duplicate error fires because
+    /// ID-routed requested fields never enter the name lookup. Expect [1, 2] -- neither the
+    /// stray column's data nor a spurious duplicate-field error.
+    #[tokio::test]
+    async fn parquet_field_id_match_beats_stray_column_with_requested_name() {
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("A", DataType::Int64, true),
+            field_with_id("a", 1),
+        ]));
+        let stray = Arc::new(Int64Array::from(vec![10, 20])) as Arc<dyn arrow::array::Array>;
+        let matched = Arc::new(Int64Array::from(vec![1, 2])) as Arc<dyn arrow::array::Array>;
+        let required_schema = Arc::new(Schema::new(vec![field_with_id("A", 1)]));
+
+        let mut opts = SparkParquetOptions::new(EvalMode::Legacy, "UTC", false);
+        opts.case_sensitive = false;
+        opts.use_field_id = true;
+
+        let batch = scan_with_adapter(file_schema, vec![stray, matched], required_schema, opts)
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 1);
+        assert_eq!(values.value(1), 2);
+    }
+
+    // -- JvmCaseTables mechanics: the native algorithm over a miniature, JDK-17-sourced
+    // table. These pin the NATIVE half; the runtime consumes tables generated by the live
+    // planning JVM (JvmCaseTables.scala), proven equal to `String.toLowerCase(Locale.ROOT)`
+    // by the JVM-side parity suite (JvmLowercaseParitySuite). --
+
+    /// Builds a miniature `JvmCaseTables` from literal data recorded from a real JDK 17
+    /// (zulu 17.0.18) `String.toLowerCase(Locale.ROOT)` run, covering exactly the codepoints
+    /// these tests touch. Expected strings in the tests below are JDK-17-sourced the same way.
+    fn jdk17_test_tables() -> JvmCaseTables {
+        let mut lower_cp: Vec<u32> = Vec::new();
+        let mut lower_repl: Vec<String> = Vec::new();
+        for cp in 0x41u32..=0x5A {
+            lower_cp.push(cp);
+            lower_repl.push(char::from_u32(cp + 0x20).unwrap().to_string());
+        }
+        let mut pair = |cp: u32, repl: &str| {
+            lower_cp.push(cp);
+            lower_repl.push(repl.to_string());
+        };
+        pair(0xC9, "\u{E9}"); // É -> é
+        pair(0x130, "i\u{307}"); // İ -> "i" + COMBINING DOT ABOVE (multi-char expansion)
+        pair(0x391, "\u{3B1}"); // Α -> α
+        pair(0x392, "\u{3B2}"); // Β -> β
+        pair(0x394, "\u{3B4}"); // Δ -> δ
+        pair(0x395, "\u{3B5}"); // Ε -> ε
+        pair(0x39F, "\u{3BF}"); // Ο -> ο
+        pair(0x3A3, "\u{3C3}"); // Σ -> σ (the isolated form; contexts handled by the scan)
+        pair(0x3A5, "\u{3C5}"); // Υ -> υ
+        pair(0x212A, "k"); // KELVIN SIGN -> ASCII k
+        pair(0x10400, "\u{10428}"); // DESERET CAPITAL LONG I -> small
+        pair(0x2160, "\u{2170}"); // ROMAN NUMERAL ONE -> small roman numeral one
+
+        #[rustfmt::skip]
+        let class_ranges: Vec<u32> = vec![
+            0x22, 0x22, CLASS_MID_NUM_LET as u32,   // '"'
+            0x27, 0x27, CLASS_MID_NUM_LET as u32,   // '\''
+            0x2C, 0x2C, CLASS_MID_NUM as u32,    // ','
+            0x2D, 0x2D, CLASS_MID_LETTER as u32,   // '-'
+            0x2E, 0x2E, CLASS_MID_NUM_LET as u32,   // '.'
+            0x30, 0x39, CLASS_NUMERIC as u32,      // 0-9
+            0x41, 0x5A, CLASS_ALETTER_CASED as u32,      // A-Z
+            0x5F, 0x5F, CLASS_MID_LETTER as u32,   // '_'
+            0x61, 0x7A, CLASS_ALETTER_CASED as u32,      // a-z
+            0xC9, 0xC9, CLASS_ALETTER_CASED as u32,      // É
+            0xDF, 0xDF, CLASS_ALETTER_CASED as u32,      // ß
+            0xE9, 0xE9, CLASS_ALETTER_CASED as u32,      // é
+            0x130, 0x131, CLASS_ALETTER_CASED as u32,    // İ, ı
+            0x301, 0x301, CLASS_EXTEND as u32, // COMBINING ACUTE (Mn, non-cased)
+            0x307, 0x307, CLASS_EXTEND as u32, // COMBINING DOT ABOVE (Mn, non-cased)
+            0x345, 0x345, CLASS_EXTEND_CASED as u32, // COMBINING GREEK YPOGEGRAMMENI
+            0x391, 0x3A9, CLASS_ALETTER_CASED as u32,    // Greek capitals
+            0x3B1, 0x3C9, CLASS_ALETTER_CASED as u32,    // Greek smalls (incl. σ, ς)
+            0x64E, 0x64E, CLASS_EXTEND as u32, // ARABIC FATHA (Mn, non-cased)
+            0x964, 0x964, CLASS_DANDA as u32,    // DEVANAGARI DANDA
+            0x200D, 0x200D, CLASS_FORMAT as u32, // ZERO WIDTH JOINER (Cf)
+            0x212A, 0x212A, CLASS_ALETTER_CASED as u32,  // KELVIN SIGN
+            0x2160, 0x2170, CLASS_NUMERIC_CASED as u32, // Roman numeral one, upper and lower
+            0x10400, 0x10400, CLASS_SUPP_CASED as u32, // DESERET CAPITAL LONG I
+            0x11374, 0x11374, CLASS_SUPP_MN as u32,  // COMBINING GRANTHA LETTER A (Mn, supp)
+            0x1D7D3, 0x1D7D3, CLASS_SUPP_NUM as u32, // MATHEMATICAL BOLD DIGIT FIVE (Nd, supp)
+            0x20000, 0x20000, CLASS_SUPP_LETTER as u32, // CJK UNIFIED IDEOGRAPH-20000 (Lo)
+        ];
+        JvmCaseTables::from_proto(&lower_cp, &lower_repl, &class_ranges)
+    }
+
+    #[test]
+    fn kelvin_sign_matches_ascii_k_and_capital_k() {
+        // U+212A KELVIN SIGN lowercases (Locale.ROOT) to ASCII 'k'. Rust's
+        // `eq_ignore_ascii_case` never looks past the ASCII range, so it would (wrongly) say
+        // these differ.
+        let t = jdk17_test_tables();
+        assert!(names_equal_ignore_case_java("\u{212A}", "k", Some(&t)));
+        assert!(names_equal_ignore_case_java("\u{212A}", "K", Some(&t)));
+        assert!(names_equal_ignore_case_java("k", "\u{212A}", Some(&t)));
+    }
+
+    #[test]
+    fn e_acute_case_pair_matches() {
+        // 'É' (U+00C9) / 'é' (U+00E9): a Latin-1 case pair outside the ASCII range.
+        let t = jdk17_test_tables();
+        assert!(names_equal_ignore_case_java("\u{c9}", "\u{e9}", Some(&t)));
+        assert!(names_equal_ignore_case_java(
+            "R\u{c9}SUM\u{c9}",
+            "r\u{e9}sum\u{e9}",
+            Some(&t)
+        ));
+    }
+
+    #[test]
+    fn greek_capital_sigma_matches_regular_lowercase_sigma() {
+        // A standalone capital sigma has no preceding cased letter, so the contextual "final
+        // sigma" rule does not apply and the unconditional mapping to σ (U+03C3) is used.
+        let t = jdk17_test_tables();
+        assert!(names_equal_ignore_case_java("\u{3a3}", "\u{3c3}", Some(&t)));
+    }
+
+    #[test]
+    fn greek_final_sigma_does_not_match_regular_lowercase_sigma() {
+        // 'ς' (U+03C2, final lowercase sigma) is already lowercase and maps to itself; it does
+        // NOT unify with 'σ' (U+03C3, regular lowercase sigma).
+        let t = jdk17_test_tables();
+        assert!(!names_equal_ignore_case_java(
+            "\u{3c2}",
+            "\u{3c3}",
+            Some(&t)
+        ));
+    }
+
+    #[test]
+    fn sharp_s_does_not_match_ss() {
+        // 'ß' (U+00DF) is already lowercase and maps to itself under `toLowerCase`, so it
+        // never unifies with "ss" -- unlike `str::to_uppercase`'s full folding to "SS".
+        let t = jdk17_test_tables();
+        assert!(!names_equal_ignore_case_java("\u{df}", "ss", Some(&t)));
+        assert!(!names_equal_ignore_case_java("\u{df}", "SS", Some(&t)));
+    }
+
+    #[test]
+    fn capital_i_with_dot_above_does_not_match_ascii_i() {
+        // 'İ' (U+0130) lowercases (Locale.ROOT) to the TWO-char string "i" + COMBINING DOT
+        // ABOVE, so it does NOT match ASCII 'I'/'i' under toLowerCase-keyed matching.
+        let t = jdk17_test_tables();
+        assert!(!names_equal_ignore_case_java("\u{130}", "I", Some(&t)));
+        assert!(!names_equal_ignore_case_java("\u{130}", "i", Some(&t)));
+    }
+
+    #[test]
+    fn dotless_i_does_not_match_ascii_i_or_capital_i() {
+        // 'ı' (U+0131) is already lowercase and maps to itself, so it does NOT unify with
+        // ASCII 'I' (which lowercases to 'i') or 'i' -- unlike Java's `Character`-level
+        // `equalsIgnoreCase`, which is not what Spark's footer matching uses.
+        let t = jdk17_test_tables();
+        assert!(!names_equal_ignore_case_java("\u{131}", "I", Some(&t)));
+        assert!(!names_equal_ignore_case_java("\u{131}", "i", Some(&t)));
+    }
+
+    #[test]
+    fn ascii_pairs_still_match() {
+        let t = jdk17_test_tables();
+        assert!(names_equal_ignore_case_java("Foo", "foo", Some(&t)));
+        assert!(names_equal_ignore_case_java("BAR", "bar", Some(&t)));
+        assert!(!names_equal_ignore_case_java("foo", "bar", Some(&t)));
+    }
+
+    #[test]
+    fn differing_lengths_never_match() {
+        let t = jdk17_test_tables();
+        assert!(!names_equal_ignore_case_java("ab", "a", Some(&t)));
+        assert!(!names_equal_ignore_case_java("", "a", Some(&t)));
+    }
+
+    #[test]
+    fn digit_keeps_final_sigma_context_open() {
+        // JDK-17-sourced: "A1Σ".toLowerCase(Locale.ROOT) == "a1ς" (FINAL sigma). The JDK's
+        // Final_Cased condition runs on word boundaries, and a digit keeps "A1Σ" one word, so
+        // the trailing sigma takes the final form -- unlike the Unicode-standard Final_Sigma
+        // (and unlike `str::to_lowercase`), where the digit is not case-ignorable and blocks
+        // the context, giving "a1σ".
+        let t = jdk17_test_tables();
+        assert_eq!(t.lowercase("A1\u{3A3}"), "a1\u{3C2}");
+        assert_ne!("A1\u{3A3}".to_lowercase(), "a1\u{3C2}");
+        assert!(names_equal_ignore_case_java(
+            "A1\u{3A3}",
+            "a1\u{3C2}",
+            Some(&t)
+        ));
+        assert!(!names_equal_ignore_case_java(
+            "A1\u{3A3}",
+            "a1\u{3C3}",
+            Some(&t)
+        ));
+    }
+
+    #[test]
+    fn word_boundaries_and_following_cased_letters_block_final_sigma() {
+        let t = jdk17_test_tables();
+        // JDK-17-sourced expected values:
+        assert_eq!(t.lowercase("A \u{3A3}"), "a \u{3C3}"); // space breaks the word
+        assert_eq!(t.lowercase("A\u{3A3}B"), "a\u{3C3}b"); // cased letter follows
+        assert_eq!(t.lowercase("\u{3A3}"), "\u{3C3}"); // isolated
+        assert_eq!(t.lowercase("\u{3A3}A"), "\u{3C3}a"); // nothing cased before
+    }
+
+    #[test]
+    fn greek_word_with_trailing_capital_sigma_lowercases_with_final_sigma() {
+        // JDK-17-sourced: a transliteration of "Odysseus" in all-capital Greek, chosen for two
+        // medial sigmas plus a word-final one: both medial Σ fold to plain σ and only the
+        // word-final Σ folds to ς.
+        let t = jdk17_test_tables();
+        assert_eq!(
+            t.lowercase("\u{39F}\u{394}\u{3A5}\u{3A3}\u{3A3}\u{395}\u{3A5}\u{3A3}"),
+            "\u{3BF}\u{3B4}\u{3C5}\u{3C3}\u{3C3}\u{3B5}\u{3C5}\u{3C2}"
+        );
+        assert!(names_equal_ignore_case_java(
+            "\u{39F}\u{394}\u{3A5}\u{3A3}\u{3A3}\u{395}\u{3A5}\u{3A3}",
+            "\u{3BF}\u{3B4}\u{3C5}\u{3C3}\u{3C3}\u{3B5}\u{3C5}\u{3C2}",
+            Some(&t)
+        ));
+    }
+
+    #[test]
+    fn greek_word_with_medial_sigma_lowercases_with_regular_sigma() {
+        // JDK-17-sourced: cased letter, sigma, cased letter -- the sigma is medial, so it folds
+        // to plain σ, and a name spelled with ς instead must NOT match.
+        let t = jdk17_test_tables();
+        assert_eq!(
+            t.lowercase("\u{391}\u{3A3}\u{392}"),
+            "\u{3B1}\u{3C3}\u{3B2}"
+        );
+        assert!(!names_equal_ignore_case_java(
+            "\u{391}\u{3A3}\u{392}",
+            "\u{3B1}\u{3C2}\u{3B2}",
+            Some(&t)
+        ));
+    }
+
+    #[test]
+    fn mid_punctuation_joins_words_per_the_jdk_rules() {
+        // JDK-17-sourced expected values. Mid-word punctuation (underscore, dash, period,
+        // apostrophe) joins letter..letter and keeps the sigma context open; it does NOT join
+        // against digits, two in a row break, and mid-num-only punctuation (comma) never joins
+        // letters.
+        let t = jdk17_test_tables();
+        assert_eq!(t.lowercase("A_\u{3A3}"), "a_\u{3C2}");
+        assert_eq!(t.lowercase("A-\u{3A3}"), "a-\u{3C2}");
+        assert_eq!(t.lowercase("A.\u{3A3}"), "a.\u{3C2}");
+        assert_eq!(t.lowercase("A,\u{3A3}"), "a,\u{3C3}");
+        assert_eq!(t.lowercase("A..\u{3A3}"), "a..\u{3C3}");
+        assert_eq!(t.lowercase("A1.\u{3A3}"), "a1.\u{3C3}");
+        assert_eq!(t.lowercase("A-1\u{3A3}"), "a-1\u{3C3}");
+        assert_eq!(t.lowercase("A\u{3A3}_b"), "a\u{3C3}_b"); // joins to a cased letter after
+    }
+
+    #[test]
+    fn cased_digit_is_cased_but_joins_words_like_a_digit_not_a_letter() {
+        // U+2160 ROMAN NUMERAL ONE: cased (the JDK's hardcoded Other_Uppercase list) but
+        // digit-typed (Nl), so it satisfies the scan's "found a cased letter" check when
+        // reached directly, yet -- unlike an ordinary cased letter -- does NOT let mid-word
+        // punctuation (only letter..letter) bridge past it; only mid-num punctuation
+        // (digit..digit) does. This is the exact class-sequence gap the multi-special pair
+        // sweep in `JvmLowercaseParitySuite` found: folding cased digits into the plain
+        // cased-letter class let mid-word marks wrongly bridge past them.
+        let t = jdk17_test_tables();
+        // Directly adjacent to the sigma: cased, so the scan finds it either direction.
+        assert_eq!(t.lowercase("\u{2160}\u{3A3}"), "\u{2170}\u{3C2}");
+        assert_eq!(t.lowercase("A\u{3A3}\u{2160}"), "a\u{3C3}\u{2170}");
+        // A mid-word mark ('-') does NOT bridge into a cased digit: non-final. (The cased
+        // digit itself is not directly adjacent to sigma in either case, so the scan must
+        // cross the dash to reach it -- and fails to, since mid-word only bridges
+        // letter..letter.)
+        assert_eq!(t.lowercase("\u{2160}-\u{3A3}"), "\u{2170}-\u{3C3}");
+        assert_eq!(t.lowercase("A-\u{2160}-\u{3A3}"), "a-\u{2170}-\u{3C3}");
+        // A mid-num mark (',') DOES bridge digit..digit into a cased digit: the '1' adjacent
+        // to sigma establishes the digit-run state, then ',' bridges back to the cased digit.
+        assert_eq!(t.lowercase("\u{2160},1\u{3A3}"), "\u{2170},1\u{3C2}");
+    }
+
+    #[test]
+    fn combining_marks_are_transparent_to_the_sigma_scan() {
+        // JDK-17-sourced: Mn marks ride along with their base ("Á" decomposed, an Arabic
+        // fatha), and the İ expansion's own combining mark does not break adjacency.
+        let t = jdk17_test_tables();
+        assert_eq!(t.lowercase("A\u{301}\u{3A3}"), "a\u{301}\u{3C2}");
+        assert_eq!(t.lowercase("A\u{64E}\u{3A3}"), "a\u{64E}\u{3C2}");
+        assert_eq!(t.lowercase("\u{130}\u{3A3}"), "i\u{307}\u{3C2}");
+    }
+
+    #[test]
+    fn cased_combining_mark_counts_only_when_attached_to_a_word() {
+        // JDK-17-sourced: U+0345 COMBINING GREEK YPOGEGRAMMENI is the one CASED combining
+        // mark. Attached to a letter or digit it satisfies the "preceded by cased" condition;
+        // base-less at string start it does not.
+        let t = jdk17_test_tables();
+        assert_eq!(t.lowercase("A\u{345}\u{3A3}"), "a\u{345}\u{3C2}");
+        assert_eq!(t.lowercase("1\u{345}\u{3A3}"), "1\u{345}\u{3C2}");
+        assert_eq!(t.lowercase("\u{345}\u{3A3}"), "\u{345}\u{3C3}");
+    }
+
+    #[test]
+    fn supplementary_cased_letter_closes_the_preceding_word() {
+        // JDK-17-sourced: the legacy break iterator attaches a supplementary character to the
+        // preceding word and closes it, so U+10400 blocks the backward scan (mid-string) but
+        // satisfies it at string start, and always satisfies the forward scan.
+        let t = jdk17_test_tables();
+        assert_eq!(t.lowercase("A\u{10400}\u{3A3}"), "a\u{10428}\u{3C3}");
+        assert_eq!(t.lowercase("\u{10400}\u{3A3}"), "\u{10428}\u{3C2}");
+        assert_eq!(t.lowercase("A\u{3A3}\u{10400}"), "a\u{3C3}\u{10428}");
+    }
+
+    #[test]
+    fn danda_chains_only_into_numbers() {
+        // JDK-17-sourced: the danda terminates a word; the segment continues past it only
+        // into digits.
+        let t = jdk17_test_tables();
+        assert_eq!(t.lowercase("A\u{964}1\u{3A3}"), "a\u{964}1\u{3C2}");
+        assert_eq!(t.lowercase("A\u{964}\u{3A3}"), "a\u{964}\u{3C3}");
+    }
+
+    #[test]
+    fn cf_format_chars_are_fully_transparent_but_mn_marks_are_not() {
+        // Real-JDK-verified: `<ignore>=[:Cf:]` loops on every state of the legacy DFA, so
+        // format characters are deleted from the sequence before segmentation -- a ZWJ
+        // anywhere in a mid-punctuation bridge leaves the bridge intact ("A-<ZWJ>Σ" and
+        // "AΣ-<ZWJ>b" behave exactly like "A-Σ" / "AΣ-b") -- while an Mn mark in the same
+        // position blocks it (the mark is orphaned: its text-order predecessor is the
+        // punctuation, not a letter-base).
+        let t = jdk17_test_tables();
+        assert_eq!(t.lowercase("A-\u{200D}\u{3A3}"), "a-\u{200D}\u{3C2}");
+        assert_eq!(t.lowercase("A-\u{301}\u{3A3}"), "a-\u{301}\u{3C3}");
+        // The forward mid-letter bridge crosses a ZWJ to the cased letter beyond, so the
+        // sigma is NOT final -- the exact residual shape the format filter fixes.
+        assert_eq!(t.lowercase("A\u{3A3}-\u{200D}b"), "a\u{3C3}-\u{200D}b");
+        assert_eq!(
+            t.lowercase("A\u{3A3}-\u{200D}\u{200D}b"),
+            "a\u{3C3}-\u{200D}\u{200D}b"
+        );
+        // An Mn mark anywhere in the same rider chain blocks that bridge.
+        assert_eq!(
+            t.lowercase("A\u{3A3}-\u{200D}\u{301}b"),
+            "a\u{3C2}-\u{200D}\u{301}b"
+        );
+        // Riders trailing the sigma itself bridge onward regardless of Cf vs Mn.
+        assert_eq!(t.lowercase("A\u{3A3}\u{200D}-B"), "a\u{3C3}\u{200D}-b");
+        assert_eq!(t.lowercase("A\u{3A3}\u{301}-B"), "a\u{3C3}\u{301}-b");
+    }
+
+    #[test]
+    fn leading_format_chars_defeat_the_supplementary_text_start_join() {
+        // Real-JDK-verified: a cased supplementary char forms a word at RAW text start
+        // ("𐐀Σ" is final), but a leading format char occupies the DFA's initial state, so
+        // the same shape behind a ZWJ is non-final.
+        let t = jdk17_test_tables();
+        assert_eq!(
+            t.lowercase("\u{200D}\u{10400}\u{3A3}"),
+            "\u{200D}\u{10428}\u{3C3}"
+        );
+    }
+
+    #[test]
+    fn supplementary_mark_anchors_a_riding_cased_mark_only_off_a_real_base() {
+        // Real-JDK-verified: a supplementary combining mark (U+11374) attaches to the
+        // preceding word but never forms one. A U+0345 riding on it counts as cased exactly
+        // when the run hangs off a real base -- and for a mid-letter bridge, only a
+        // letter-flavored one.
+        let t = jdk17_test_tables();
+        assert_eq!(
+            t.lowercase("A\u{11374}\u{345}\u{3A3}"),
+            "a\u{11374}\u{345}\u{3C2}"
+        );
+        assert_eq!(
+            t.lowercase("\u{11374}\u{345}\u{3A3}"),
+            "\u{11374}\u{345}\u{3C3}"
+        );
+        assert_eq!(
+            t.lowercase("A\u{11374}\u{345}-\u{3A3}"),
+            "a\u{11374}\u{345}-\u{3C2}"
+        );
+        assert_eq!(
+            t.lowercase("\u{2160}\u{11374}\u{345}-\u{3A3}"),
+            "\u{2170}\u{11374}\u{345}-\u{3C3}"
+        );
+    }
+
+    #[test]
+    fn supplementary_digit_carries_a_riding_cased_mark_only_in_digit_context() {
+        // Real-JDK-verified: a word-forming supplementary digit (U+1D7D3) backs a riding
+        // U+0345 against a bare sigma and across mid-num punctuation in digit context, but
+        // never across mid-letter punctuation.
+        let t = jdk17_test_tables();
+        assert_eq!(
+            t.lowercase("A\u{1D7D3}\u{345}\u{3A3}"),
+            "a\u{1D7D3}\u{345}\u{3C2}"
+        );
+        assert_eq!(
+            t.lowercase("A\u{1D7D3}\u{345},1\u{3A3}"),
+            "a\u{1D7D3}\u{345},1\u{3C2}"
+        );
+        assert_eq!(
+            t.lowercase("A\u{1D7D3}\u{345}-\u{3A3}"),
+            "a\u{1D7D3}\u{345}-\u{3C3}"
+        );
+    }
+
+    #[test]
+    fn assigned_noncased_supplementary_letter_backs_a_following_cased_mark() {
+        // Real-JDK-verified: an assigned non-cased supplementary letter (Lo, e.g. CJK
+        // Extension B) is still a genuine letter-base -- unlike a plain word boundary, it can
+        // back a following CLASS_EXTEND_CASED (U+0345), which is cased once its run is
+        // attached, even though the base itself never counts as cased directly.
+        let t = jdk17_test_tables();
+        assert_eq!(
+            t.lowercase("\u{20000}\u{345}\u{3A3}"),
+            "\u{20000}\u{345}\u{3C2}"
+        );
+        assert_eq!(t.lowercase("\u{20000}\u{3A3}"), "\u{20000}\u{3C3}");
+    }
+
+    #[test]
+    fn backward_mid_word_bridge_credits_a_cased_mark_riding_a_noncased_base() {
+        // Real-JDK-verified: scanning backward through a mid-word connector to find its base
+        // legitimately walks riders-then-base (marks trail their base in text order). A
+        // CLASS_EXTEND_CASED (U+0345) found along that walk is cased once the bridge
+        // validates, regardless of whether the ultimate base underneath it is itself cased.
+        let t = jdk17_test_tables();
+        assert_eq!(
+            t.lowercase("\u{20000}\u{345}_\u{3A3}"),
+            "\u{20000}\u{345}_\u{3C2}"
+        );
+    }
+
+    #[test]
+    fn forward_mid_word_bridge_rejects_an_orphaned_mark_after_the_punctuation() {
+        // Real-JDK-verified: unlike the backward-scan bridge, a mark found IMMEDIATELY after
+        // mid-word punctuation (before any real base) is orphaned -- its text-order
+        // predecessor is the punctuation, not a letter -- so the forward bridge must reject
+        // it rather than skipping past it to a real letter beyond.
+        let t = jdk17_test_tables();
+        assert_eq!(t.lowercase("A\u{3A3}-\u{301}B"), "a\u{3C2}-\u{301}b");
+    }
+
+    #[test]
+    fn absent_tables_fall_back_to_rust_lowercase() {
+        // Without shipped tables -- non-scan `SparkParquetOptions` consumers (e.g. general
+        // struct-to-struct type conversion), Rust-only unit tests of the matching logic that
+        // skip the JVM proto round trip, or a defensively malformed plan -- matching falls
+        // back to `str::to_lowercase`: correct for all simple mappings (Kelvin sign, ASCII)
+        // and knowingly divergent from the JVM only where the Unicode snapshots or the sigma
+        // word-context differ.
+        assert_eq!(java_lowercase("A1\u{3A3}", None), "a1\u{3C3}");
+        assert!(names_equal_ignore_case_java("\u{212A}", "k", None));
+        assert!(names_equal_ignore_case_java("Foo", "foo", None));
+        assert!(!names_equal_ignore_case_java(
+            "A1\u{3A3}",
+            "a1\u{3C2}",
+            None
+        ));
+    }
+
+    #[test]
+    fn unknown_class_values_read_as_word_boundaries() {
+        // A newer JVM-side generator may ship class values this build does not know; they must
+        // degrade to the safe reading (word boundary), never crash or misclassify.
+        let t = JvmCaseTables::from_proto(
+            &[0x41],
+            &["a".to_string()],
+            &[0x41, 0x5A, 99, 0x3B1, 0x3C9, CLASS_ALETTER_CASED as u32],
+        );
+        // 'A' (class 99 -> boundary) does not open the sigma context...
+        assert_eq!(t.lowercase("A\u{3A3}"), "a\u{3C3}");
+        // ...while a known cased class still does.
+        assert_eq!(t.lowercase("\u{3B1}\u{3A3}"), "\u{3B1}\u{3C2}");
+    }
+
+    #[test]
+    fn malformed_proto_degrades_entry_by_entry() {
+        // Misaligned lowercase arrays: extra codepoints without replacements are dropped.
+        let t = JvmCaseTables::from_proto(&[0x41, 0x42], &["a".to_string()], &[]);
+        assert_eq!(t.lowercase("AB"), "aB");
+        // A trailing partial triple and an inverted range are dropped; the valid triple works.
+        let t = JvmCaseTables::from_proto(
+            &[],
+            &[],
+            &[
+                0x61,
+                0x7A,
+                CLASS_ALETTER_CASED as u32,
+                0x5A,
+                0x41, // inverted -- dropped
+                CLASS_ALETTER_CASED as u32,
+                0x30, // trailing partial triple -- dropped
+            ],
+        );
+        assert_eq!(t.lowercase("a\u{3A3}"), "a\u{3C2}");
+        assert_eq!(t.lowercase("A\u{3A3}"), "A\u{3C3}");
+    }
+
+    #[test]
+    fn equal_tables_hash_and_compare_equal() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let a = jdk17_test_tables();
+        let b = jdk17_test_tables();
+        assert_eq!(a, b);
+        let hash = |t: &JvmCaseTables| {
+            let mut h = DefaultHasher::new();
+            t.hash(&mut h);
+            h.finish()
+        };
+        assert_eq!(hash(&a), hash(&b));
+        let c = JvmCaseTables::from_proto(&[0x41], &["a".to_string()], &[]);
+        assert_ne!(a, c);
+    }
+
+    // -- remap_physical_schema: end-to-end wiring of the Java-parity matcher into the schema
+    // remap that Spark's scan relies on. --
+
+    #[test]
+    fn remap_case_sensitive_does_not_fold_kelvin_sign_to_ascii_k() {
+        let logical = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let physical = Arc::new(Schema::new(vec![Field::new(
+            "\u{212A}",
+            DataType::Int64,
+            true,
+        )]));
+
+        let (remapped, name_map) = remap_physical_schema(
+            &logical,
+            &physical,
+            /* case_sensitive */ true,
+            Some(&jdk17_test_tables()),
+            false,
+            false,
+        )
+        .unwrap();
+
+        // No case-insensitive fallback in case-sensitive mode: the physical field name is left
+        // untouched and no remap entry is recorded.
+        assert_eq!(remapped.field(0).name(), "\u{212A}");
+        assert!(name_map.is_empty());
+    }
+
+    #[test]
+    fn remap_case_insensitive_folds_kelvin_sign_to_ascii_k() {
+        let logical = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let physical = Arc::new(Schema::new(vec![Field::new(
+            "\u{212A}",
+            DataType::Int64,
+            true,
+        )]));
+
+        let (remapped, name_map) = remap_physical_schema(
+            &logical,
+            &physical,
+            /* case_sensitive */ false,
+            Some(&jdk17_test_tables()),
+            false,
+            false,
+        )
+        .unwrap();
+
+        // The physical field is renamed to the logical name so the default expr adapter's
+        // exact-name lookup hits, and the reverse map records the original physical name.
+        assert_eq!(remapped.field(0).name(), "k");
+        assert_eq!(name_map.get("k").map(String::as_str), Some("\u{212A}"));
+    }
+
+    #[test]
+    fn remap_field_id_shield_is_exact_in_case_sensitive_mode() {
+        // Logical `k` carries field ID 5, so Spark's `matchIdField` resolves it strictly by
+        // ID; a physical field named exactly `k` with no matching ID must be shielded from
+        // the downstream exact-name lookup. Physical `K`, however, is a DIFFERENT name under
+        // case-sensitive matching (Spark's `matchCaseSensitiveField` keys on the exact
+        // string), so it must stay untouched: nothing can name-match it, and hiding it would
+        // wrongly null a legitimate exact-name lookup elsewhere. JVM case tables are only
+        // shipped when `case_sensitive = false`, so `tables: None` is the live configuration.
+        let logical = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "5".to_string(),
+            )]))]));
+        let physical = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("K", DataType::Int64, true),
+        ]));
+
+        let (remapped, name_map) = remap_physical_schema(
+            &logical, &physical, /* case_sensitive */ true, /* case_tables */ None,
+            /* use_field_id */ true, /* ignore_missing_field_id */ true,
+        )
+        .unwrap();
+
+        assert_ne!(remapped.field(0).name(), "k");
+        assert_ne!(remapped.field(0).name(), "K");
+        assert_eq!(remapped.field(1).name(), "K");
+        assert!(name_map.is_empty());
+    }
+
+    #[test]
+    fn remap_case_sensitive_keeps_exact_name_for_id_less_logical_field() {
+        // Greek capital Kappa (U+039A) carries field ID 1; lowercase kappa (U+03BA) carries
+        // no ID. The file holds only `κ` with field ID 2. Spark null-fills `Κ` (ID 1 absent,
+        // `matchIdField` -> fake REQUESTED name) but resolves the ID-less `κ` by exact name
+        // through `matchCaseSensitiveField`, reading the real column. The physical `κ` must
+        // therefore survive the remap untouched -- `Κ` and `κ` only collide under a case
+        // fold, which case-sensitive matching must not apply.
+        let logical = Arc::new(Schema::new(vec![
+            Field::new("\u{39A}", DataType::Int64, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("\u{3BA}", DataType::Int64, true),
+        ]));
+        let physical = Arc::new(Schema::new(vec![Field::new(
+            "\u{3BA}",
+            DataType::Int64,
+            true,
+        )
+        .with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "2".to_string(),
+        )]))]));
+
+        let (remapped, name_map) = remap_physical_schema(
+            &logical, &physical, /* case_sensitive */ true, /* case_tables */ None,
+            /* use_field_id */ true, /* ignore_missing_field_id */ false,
+        )
+        .unwrap();
+
+        assert_eq!(remapped.field(0).name(), "\u{3BA}");
+        assert!(name_map.is_empty());
+    }
+
+    #[test]
+    fn remap_case_insensitive_claim_beats_unmatched_id_shield() {
+        // Case-insensitive variant of the Kappa scenario. Spark's `matchCaseInsensitiveField`
+        // resolves the ID-less requested `κ` through the `toLowerCase(Locale.ROOT)`-keyed
+        // physical field map, which contains the file's `κ` -- the unmatched-ID requested `Κ`
+        // only gets its own REQUESTED name faked and never blocks that lookup. So the
+        // physical `κ` must be claimed by the name match (and kept), not hidden by the
+        // shield, even though `Κ` and `κ` are equal under the case fold.
+        let logical = Arc::new(Schema::new(vec![
+            Field::new("\u{39A}", DataType::Int64, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("\u{3BA}", DataType::Int64, true),
+        ]));
+        let physical = Arc::new(Schema::new(vec![Field::new(
+            "\u{3BA}",
+            DataType::Int64,
+            true,
+        )
+        .with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "2".to_string(),
+        )]))]));
+
+        let (remapped, name_map) = remap_physical_schema(
+            &logical, &physical, /* case_sensitive */ false, /* case_tables */ None,
+            /* use_field_id */ true, /* ignore_missing_field_id */ false,
+        )
+        .unwrap();
+
+        assert_eq!(remapped.field(0).name(), "\u{3BA}");
+        assert!(name_map.is_empty());
+    }
+
+    #[test]
+    fn remap_shields_stray_physical_field_named_like_id_matched_logical_field() {
+        // The file holds a stray ID-less `A` FIRST and the real ID match `a` (ID 1) second.
+        // Spark reads requested `A` (ID 1) from physical `a` via `matchIdField`; the stray
+        // `A` is never requested. After the remap renames `a` -> `A`, the stray physical `A`
+        // must not remain as a second exact-name candidate ahead of it, or the downstream
+        // adapter's name lookup would resolve `A` to the wrong column's data.
+        let logical = Arc::new(Schema::new(vec![Field::new("A", DataType::Int64, true)
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )]))]));
+        let physical = Arc::new(Schema::new(vec![
+            Field::new("A", DataType::Int64, true),
+            Field::new("a", DataType::Int64, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+
+        let (remapped, name_map) = remap_physical_schema(
+            &logical, &physical, /* case_sensitive */ true, /* case_tables */ None,
+            /* use_field_id */ true, /* ignore_missing_field_id */ false,
+        )
+        .unwrap();
+
+        assert_ne!(remapped.field(0).name(), "A");
+        assert_ne!(remapped.field(0).name(), "a");
+        assert_eq!(remapped.field(1).name(), "A");
+        assert_eq!(name_map.get("A").map(String::as_str), Some("a"));
+    }
+
+    #[test]
+    fn remap_fake_names_never_collide_with_real_columns() {
+        // A real column may legitimately be named like the fake-name pattern. Spark's
+        // `generateFakeColumnName` embeds a random UUID, so its fakes can never shadow a
+        // real column; the deterministic counter here must skip past reserved names to give
+        // the same guarantee, otherwise the shielded field would duplicate the real
+        // `__comet_unmatched_field_id_1` and could steal its exact-name match.
+        let logical = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("__comet_unmatched_field_id_1", DataType::Int64, true),
+        ]));
+        let physical = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("__comet_unmatched_field_id_1", DataType::Int64, true),
+        ]));
+
+        let (remapped, name_map) = remap_physical_schema(
+            &logical, &physical, /* case_sensitive */ true, /* case_tables */ None,
+            /* use_field_id */ true, /* ignore_missing_field_id */ true,
+        )
+        .unwrap();
+
+        // Physical `a` collides with the ID-bearing logical `a` (its ID is absent from the
+        // file) and gets shielded -- but not with the taken fake name.
+        assert_eq!(remapped.field(0).name(), "__comet_unmatched_field_id_2");
+        // The real column matching the fake pattern is untouched and still name-matchable.
+        assert_eq!(remapped.field(1).name(), "__comet_unmatched_field_id_1");
+        assert!(name_map.is_empty());
     }
 }

@@ -21,12 +21,19 @@ package org.apache.comet
 
 import scala.collection.mutable
 
+import org.apache.spark.SparkConf
 import org.apache.spark.sql.{CometTestBase, DataFrame}
 import org.apache.spark.sql.comet.CometNativeExec
 
 import org.apache.comet.serde.{ExprOuterClass, OperatorOuterClass}
 
 class QueryContextInternerSuite extends CometTestBase {
+
+  // Case-insensitive scans ship the JVM case-mapping tables, a fixed per-scan payload that is
+  // independent of SQL-text interning and would dilute the size ratios below. Pin the suite to
+  // case-sensitive analysis so it measures interning alone.
+  override protected def sparkConf: SparkConf =
+    super.sparkConf.set("spark.sql.caseSensitive", "true")
 
   private val sqlText =
     """select k1,
