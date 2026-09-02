@@ -651,6 +651,9 @@ pub(crate) fn names_equal_ignore_case_java(
     b: &str,
     tables: Option<&JvmCaseTables>,
 ) -> bool {
+    if a.is_ascii() && b.is_ascii() {
+        return a.eq_ignore_ascii_case(b);
+    }
     java_lowercase(a, tables) == java_lowercase(b, tables)
 }
 
@@ -2727,6 +2730,12 @@ mod test {
         assert!(names_equal_ignore_case_java("Foo", "foo", Some(&t)));
         assert!(names_equal_ignore_case_java("BAR", "bar", Some(&t)));
         assert!(!names_equal_ignore_case_java("foo", "bar", Some(&t)));
+    }
+
+    #[test]
+    fn ascii_matching_does_not_depend_on_jvm_tables() {
+        let empty = JvmCaseTables::from_proto(&[], &[], &[]);
+        assert!(names_equal_ignore_case_java("Foo", "foo", Some(&empty)));
     }
 
     #[test]
