@@ -153,8 +153,9 @@ pub fn build_access_plan(
     deleted: &RoaringTreemap,
 ) -> Result<ParquetAccessPlan, ExecutionError> {
     let mut plan = ParquetAccessPlan::new_all(row_group_row_counts.len());
-    // Single sweep over the (sorted) deleted row indexes, bucketing by row group.
-    let mut deleted_iter = deleted.iter().peekable();
+    // Bucket sorted deleted row indexes by row group, seeking past compressed full groups.
+    let mut deleted_iter = deleted.iter();
+    let mut next_deleted = deleted_iter.next();
     let mut group_start = 0u64;
     for (idx, &num_rows) in row_group_row_counts.iter().enumerate() {
         // A corrupt footer can report a negative row count. `num_rows as u64` would otherwise
@@ -168,15 +169,24 @@ pub fn build_access_plan(
         }
         let num_rows = num_rows as u64;
         let group_end = group_start + num_rows;
+        // Keep compressed full-group deletions compressed instead of walking every row.
+        if num_rows > 0
+            && next_deleted == Some(group_start)
+            && deleted.contains_range(group_start..group_end)
+        {
+            plan.skip(idx);
+            deleted_iter.advance_to(group_end);
+            next_deleted = deleted_iter.next();
+            group_start = group_end;
+            continue;
+        }
         let mut selectors: Vec<RowSelector> = Vec::new();
         let mut cursor = group_start;
-        let mut deleted_in_group = 0u64;
-        while let Some(&row) = deleted_iter.peek() {
+        while let Some(row) = next_deleted {
             if row >= group_end {
                 break;
             }
-            deleted_iter.next();
-            deleted_in_group += 1;
+            next_deleted = deleted_iter.next();
             if row > cursor {
                 selectors.push(RowSelector::select((row - cursor) as usize));
             }
@@ -187,9 +197,7 @@ pub fn build_access_plan(
             }
             cursor = row + 1;
         }
-        if deleted_in_group == num_rows && num_rows > 0 {
-            plan.skip(idx);
-        } else if deleted_in_group > 0 {
+        if !selectors.is_empty() {
             if group_end > cursor {
                 selectors.push(RowSelector::select((group_end - cursor) as usize));
             }
@@ -200,7 +208,7 @@ pub fn build_access_plan(
     // A deleted index beyond the file's total row count means the DV does not
     // belong to this file (stale or corrupted metadata); silently dropping it
     // would under-apply deletions.
-    if let Some(&row) = deleted_iter.peek() {
+    if let Some(row) = next_deleted {
         return Err(GeneralError(format!(
             "Deletion vector marks row {row} but the file only has {group_start} rows"
         )));
@@ -1066,6 +1074,16 @@ mod tests {
             }
             other => panic!("expected selection, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn access_plan_skips_large_fully_deleted_row_group_without_expanding_it() {
+        let mut deleted = RoaringTreemap::new();
+        deleted.insert_range(0..1_000_000_000);
+
+        let plan = build_access_plan(&[1_000_000_000], &deleted).unwrap();
+
+        assert_eq!(&plan.inner()[0], &RowGroupAccess::Skip);
     }
 
     #[test]
