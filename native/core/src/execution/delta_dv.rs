@@ -153,8 +153,17 @@ pub fn build_access_plan(
     deleted: &RoaringTreemap,
 ) -> Result<ParquetAccessPlan, ExecutionError> {
     let mut plan = ParquetAccessPlan::new_all(row_group_row_counts.len());
-    // Single sweep over the (sorted) deleted row indexes, bucketing by row group.
-    let mut deleted_iter = deleted.iter().peekable();
+    // Bucket sorted deleted row ranges by row group without expanding compressed runs.
+    let mut deleted_ranges = deleted.bitmaps().flat_map(|(key, bitmap)| {
+        let prefix = (key as u64) << 32;
+        let mut values = bitmap.iter();
+        std::iter::from_fn(move || {
+            values
+                .next_range()
+                .map(|range| (prefix | *range.start() as u64, prefix | *range.end() as u64))
+        })
+    });
+    let mut next_deleted = deleted_ranges.next();
     let mut group_start = 0u64;
     for (idx, &num_rows) in row_group_row_counts.iter().enumerate() {
         // A corrupt footer can report a negative row count. `num_rows as u64` would otherwise
@@ -170,37 +179,43 @@ pub fn build_access_plan(
         let group_end = group_start + num_rows;
         let mut selectors: Vec<RowSelector> = Vec::new();
         let mut cursor = group_start;
-        let mut deleted_in_group = 0u64;
-        while let Some(&row) = deleted_iter.peek() {
-            if row >= group_end {
+        while let Some((run_start, run_end)) = next_deleted {
+            if run_start >= group_end {
                 break;
             }
-            deleted_iter.next();
-            deleted_in_group += 1;
-            if row > cursor {
-                selectors.push(RowSelector::select((row - cursor) as usize));
+            let start = run_start.max(group_start);
+            if start > cursor {
+                selectors.push(RowSelector::select((start - cursor) as usize));
             }
-            // Merge runs of consecutive deleted rows into one skip.
+            let end = run_end.min(group_end - 1);
+            let skipped = (end - start + 1) as usize;
             match selectors.last_mut() {
-                Some(last) if last.skip => last.row_count += 1,
-                _ => selectors.push(RowSelector::skip(1)),
+                Some(last) if last.skip => last.row_count += skipped,
+                _ => selectors.push(RowSelector::skip(skipped)),
             }
-            cursor = row + 1;
+            cursor = end + 1;
+            if run_end > end {
+                next_deleted = Some((cursor, run_end));
+                break;
+            }
+            next_deleted = deleted_ranges.next();
         }
-        if deleted_in_group == num_rows && num_rows > 0 {
-            plan.skip(idx);
-        } else if deleted_in_group > 0 {
+        if !selectors.is_empty() {
             if group_end > cursor {
                 selectors.push(RowSelector::select((group_end - cursor) as usize));
             }
-            plan.scan_selection(idx, RowSelection::from(selectors));
+            if selectors.len() == 1 && selectors[0].skip {
+                plan.skip(idx);
+            } else {
+                plan.scan_selection(idx, RowSelection::from(selectors));
+            }
         }
         group_start = group_end;
     }
     // A deleted index beyond the file's total row count means the DV does not
     // belong to this file (stale or corrupted metadata); silently dropping it
     // would under-apply deletions.
-    if let Some(&row) = deleted_iter.peek() {
+    if let Some((row, _)) = next_deleted {
         return Err(GeneralError(format!(
             "Deletion vector marks row {row} but the file only has {group_start} rows"
         )));
@@ -1066,6 +1081,79 @@ mod tests {
             }
             other => panic!("expected selection, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn access_plan_skips_large_fully_deleted_row_group_without_expanding_it() {
+        let mut deleted = RoaringTreemap::new();
+        deleted.insert_range(0..1_000_000_000);
+
+        let plan = build_access_plan(&[1_000_000_000], &deleted).unwrap();
+
+        assert_eq!(&plan.inner()[0], &RowGroupAccess::Skip);
+    }
+
+    #[test]
+    fn access_plan_keeps_large_partial_deleted_run_compressed() {
+        let mut deleted = RoaringTreemap::new();
+        deleted.insert_range(1..999_999_999);
+
+        let plan = build_access_plan(&[1_000_000_000], &deleted).unwrap();
+        let RowGroupAccess::Selection(selection) = &plan.inner()[0] else {
+            panic!("expected selection");
+        };
+        let selectors: Vec<RowSelector> = selection.clone().into();
+        assert_eq!(
+            selectors,
+            vec![
+                RowSelector::select(1),
+                RowSelector::skip(999_999_998),
+                RowSelector::select(1)
+            ]
+        );
+    }
+
+    #[test]
+    fn access_plan_splits_deleted_run_across_row_groups() {
+        let mut deleted = RoaringTreemap::new();
+        deleted.insert_range(5..25);
+
+        let plan = build_access_plan(&[10, 10, 10], &deleted).unwrap();
+        let selections: Vec<RowGroupAccess> = plan.inner().to_vec();
+        assert_eq!(
+            selections,
+            vec![
+                RowGroupAccess::Selection(RowSelection::from(vec![
+                    RowSelector::select(5),
+                    RowSelector::skip(5),
+                ])),
+                RowGroupAccess::Skip,
+                RowGroupAccess::Selection(RowSelection::from(vec![
+                    RowSelector::skip(5),
+                    RowSelector::select(5),
+                ])),
+            ]
+        );
+    }
+
+    #[test]
+    fn access_plan_coalesces_run_across_bitmap_partitions() {
+        let boundary = 1u64 << 32;
+        let mut deleted = RoaringTreemap::new();
+        deleted.insert_range(boundary - 1..boundary + 2);
+
+        let plan = build_access_plan(&[(boundary + 2) as i64], &deleted).unwrap();
+        let RowGroupAccess::Selection(selection) = &plan.inner()[0] else {
+            panic!("expected selection");
+        };
+        let selectors: Vec<RowSelector> = selection.clone().into();
+        assert_eq!(
+            selectors,
+            vec![
+                RowSelector::select((boundary - 1) as usize),
+                RowSelector::skip(3),
+            ]
+        );
     }
 
     #[test]
