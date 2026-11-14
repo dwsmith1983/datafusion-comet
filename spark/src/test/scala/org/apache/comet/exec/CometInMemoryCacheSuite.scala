@@ -32,7 +32,7 @@ import org.apache.arrow.memory.{ArrowBuf, BufferAllocator}
 import org.apache.arrow.vector.{BitVector, FixedSizeBinaryVector, IntVector, LargeVarCharVector, VarBinaryVector, VarCharVector}
 import org.apache.arrow.vector.compression.{CompressionCodec, CompressionUtil, NoCompressionCodec}
 import org.apache.arrow.vector.types.pojo.ArrowType
-import org.apache.spark.{SparkConf, SparkException}
+import org.apache.spark.{SparkConf, SparkEnv, SparkException}
 import org.apache.spark.CometDriverPlugin
 import org.apache.spark.sql.{CometTestBase, DataFrame, Observation, QueryTest, Row}
 import org.apache.spark.sql.catalyst.expressions.{And, Ascending, Attribute, AttributeReference, EqualTo, Expression, GreaterThan, GreaterThanOrEqual, LessThan, Literal}
@@ -43,7 +43,7 @@ import org.apache.spark.sql.comet.{CometBroadcastHashJoinExec, CometBroadcastNes
 import org.apache.spark.sql.comet.execution.arrow.{ArrowCachedBatchSerializer, CometCachedBatchHelper}
 import org.apache.spark.sql.comet.execution.shuffle.CometCelebornShuffleManager
 import org.apache.spark.sql.comet.util.Utils
-import org.apache.spark.sql.execution.{ColumnarToRowExec, CometSparkPlanInfoHelper, FileSourceScanExec, FilterExec, FormattedMode, RowToColumnarExec, SortExec, SparkPlan, SparkPlanInfo}
+import org.apache.spark.sql.execution.{ColumnarToRowExec, CometSparkPlanInfoHelper, FileSourceScanExec, FilterExec, FormattedMode, RowToColumnarExec, SortExec, SparkPlan, SparkPlanInfo, WholeStageCodegenExec}
 import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, AQEShuffleReadExec, QueryStageExec, ShuffleQueryStageExec}
 import org.apache.spark.sql.execution.columnar.{CometInMemoryRelationHelper, InMemoryRelation, InMemoryTableScanExec}
 import org.apache.spark.sql.execution.exchange.{Exchange, ReusedExchangeExec, ShuffleExchangeLike}
@@ -3975,6 +3975,91 @@ class CometInMemoryCacheSuite extends CometTestBase {
         }
       }
     }
+  }
+
+  // A broadcast left outer hash join runs as DataFusion's right outer join, and the native filter
+  // under it keeps the serde from seeing that the join declared its order on the probe input, so
+  // a window that stays in Spark above the join doubts the (v, w) order the join reports. The
+  // lower window has no PARTITION BY, so it stays in Spark, and needs only v's order. Spark plans
+  // no sort of its own for the window ordered by (v, w) above, or for a sortWithinPartitions by
+  // (v, w), so the sort put under the lower window has to be by both. The join's rows arrive in
+  // (v, w) order either way, so a sort by v alone loses that order only when it spills: the test
+  // without a spill checks the sort's keys, and the spilling test checks the rows as well.
+  private def checkOrderAboveSparkWindow(rowCount: Long): Unit = {
+    withConversions(
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1") {
+      try {
+        // A match for v = 0 and v = 1 only, so the join has unmatched rows, which it would move
+        // if its probe input declared no order.
+        val small = spark.range(2).toDF("z").hint("broadcast")
+        val lower = spark
+          .range(0, rowCount, 1, 1)
+          .selectExpr("id % 4 AS v", "id AS w")
+          .sortWithinPartitions("v", "w")
+          .cache()
+          .where("w >= 0")
+          .join(small, col("v") === col("z"), "left_outer")
+          .selectExpr("v", "w", "sum(w) OVER (ORDER BY v) AS s")
+        val upper = lower.selectExpr("*", "row_number() OVER (ORDER BY v, w) AS r")
+        val upperPlan = upper.queryExecution.executedPlan
+        assert(collect(upperPlan) { case w: WindowExec => w }.size == 2, upperPlan)
+        assertOnlySortUnderLowerWindow(upperPlan)
+        checkSparkAnswer(upper)
+        val sorted = lower.sortWithinPartitions("v", "w")
+        val plan = sorted.queryExecution.executedPlan
+        assert(collect(plan) { case w: WindowExec => w }.size == 1, plan)
+        assertOnlySortUnderLowerWindow(plan)
+        val joins = collect(plan) { case j: CometBroadcastHashJoinExec => j }
+        assert(
+          joins.size == 1 && joins.head.joinType == LeftOuter &&
+            joins.head.buildSide == BuildRight &&
+            joins.head.nativeOp.getHashJoin.getStreamedSortOrdersCount > 0,
+          plan)
+        val rows = sorted.collect().map(r => (r.getLong(0), r.getLong(1)))
+        val outOfOrder = rows.sliding(2).collectFirst {
+          case Array(a, b) if Ordering[(Long, Long)].gt(a, b) => s"$a comes before $b"
+        }
+        assert(outOfOrder.isEmpty, outOfOrder)
+      } finally {
+        spark.catalog.clearCache()
+      }
+    }
+  }
+
+  // checkOrderAboveSparkWindow rests on Spark having planned no sort of its own above the lower
+  // window, so the one sort in the plan is the one under that window, by v then w.
+  private def assertOnlySortUnderLowerWindow(plan: SparkPlan): Unit = {
+    val sorts = collect(plan) { case s @ (_: SortExec | _: CometSortExec) => s }
+    val lowerWindows = collect(plan) {
+      case w: WindowExec if collect(w.child) { case c: WindowExec => c }.isEmpty => w
+    }
+    assert(sorts.size == 1 && lowerWindows.size == 1, plan)
+    val windowInput = lowerWindows.head.child match {
+      case stage: WholeStageCodegenExec => stage.child
+      case child => child
+    }
+    assert(windowInput eq sorts.head, plan)
+    val keys = sorts.head match {
+      case s: SortExec => s.sortOrder.map(_.child)
+      case s: CometSortExec => s.sortOrder.map(_.child)
+    }
+    assert(keys.map { case a: Attribute => a.name; case e => e.toString } == Seq("v", "w"), plan)
+  }
+
+  test("a Spark window over an outer hash join over a native filter sorts by the whole order") {
+    // The rows stay in order under a sort by v alone here, so this checks the sort's keys.
+    checkOrderAboveSparkWindow(4000)
+  }
+
+  test("a spilling sort under a Spark window over an outer hash join keeps the whole order") {
+    // A sort by v alone may reorder the rows that tie on v when it merges its spill files.
+    val key = "spark.shuffle.spill.numElementsForceSpillThreshold"
+    val conf = SparkEnv.get.conf
+    val previous = conf.getOption(key)
+    conf.set(key, "10000")
+    try checkOrderAboveSparkWindow(200000)
+    finally previous.fold(conf.remove(key))(conf.set(key, _))
   }
 
   test("an aggregate on the key above a hash join over a sorted cache groups each key once") {
